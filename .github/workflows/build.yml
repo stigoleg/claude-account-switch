@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Lint
+        if: matrix.os == 'macos-15'
+        run: make lint
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Build .app bundle
+        run: make build
+
+      # Snapshot artifact from main pushes. Stamped 0.0.0-dev (shallow,
+      # untagged checkout) — correct for a non-release build; tagged releases
+      # go through release.yml.
+      - name: Zip .app for artifact
+        if: github.event_name == 'push' && matrix.os == 'macos-15'
+        run: ditto -c -k --sequesterRsrc --keepParent "build/Claude Profile Switcher.app" app.zip
+
+      - name: Upload .app artifact
+        if: github.event_name == 'push' && matrix.os == 'macos-15'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeProfileSwitcher-${{ github.sha }}
+          path: app.zip
+          retention-days: 7

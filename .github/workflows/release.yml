@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Required: Scripts/version.sh uses `git describe --exact-match`
+          # and `git rev-list --count`, both of which need full history.
+          fetch-depth: 0
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Guard — tag must match resolved version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          RESOLVED="$(make -s version)"
+          if [ "$TAG_VERSION" != "$RESOLVED" ]; then
+            echo "::error::tag $TAG_VERSION != resolved version $RESOLVED"
+            exit 1
+          fi
+
+      # ── Developer ID slot ──────────────────────────────────────────────
+      # To ship notarized builds later, insert here (no restructuring needed):
+      #   1. Import the cert: secrets.DEVELOPER_ID_P12 / _PASSWORD into a
+      #      temporary keychain.
+      #   2. Export CODESIGN_IDENTITY="Developer ID Application: …" for the
+      #      build step below (build-app.sh picks it up).
+      #   3. After "Build release artifacts": xcrun notarytool submit the zip
+      #      with an App Store Connect API key, then stapler staple + re-zip.
+      # ───────────────────────────────────────────────────────────────────
+
+      - name: Build release artifacts (zip + dmg + checksums)
+        run: make dist
+
+      - name: Verify stamped version in bundle
+        run: |
+          STAMPED=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "build/Claude Profile Switcher.app/Contents/Info.plist")
+          if [ "$STAMPED" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::bundle stamped $STAMPED, expected ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.zip dist/*.dmg dist/SHA256SUMS
+
+  # Bumps the Homebrew cask in the tap repo. Requires the TAP_GITHUB_TOKEN
+  # secret: a fine-grained PAT scoped to ONLY the tap repo with contents
+  # read/write (the default GITHUB_TOKEN cannot push to other repos).
+  # Skips gracefully while the tap/secret don't exist yet.
+  update-cask:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check tap token
+        id: token
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::TAP_GITHUB_TOKEN not set — skipping Homebrew cask update."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.skip != 'true'
+        with:
+          repository: stigoleg/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Bump cask version and sha256
+        if: steps.token.outputs.skip != 'true'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ClaudeProfileSwitcher-${VERSION}.zip"
+          # Re-download the published asset so the checksum covers the exact
+          # bytes users will fetch.
+          curl -fsSL --retry 5 --retry-delay 5 -o app.zip "$URL"
+          SHA="$(sha256sum app.zip | cut -d' ' -f1)"
+          sed -i -E \
+            -e "s|^  version \".*\"|  version \"${VERSION}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" \
+            Casks/claude-profile-switcher.rb
+          rm app.zip
+
+      - name: Commit and push
+        if: steps.token.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "claude-profile-switcher ${GITHUB_REF_NAME#v}"
+          git push

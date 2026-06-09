@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>ClaudeProfileSwitcher</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.stigole.ClaudeProfileSwitcher</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Claude Profile Switcher</string>
+    <key>CFBundleDisplayName</key>
+    <string>Claude Profile Switcher</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <!-- Template values — stamped at build time by build-app.sh from
+         Scripts/version.sh (git tag → version, commit count → build number). -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Claude Profile Switcher opens a Terminal window so you can sign in to Claude Code (CLI).</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Personal tool — not affiliated with Anthropic.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
