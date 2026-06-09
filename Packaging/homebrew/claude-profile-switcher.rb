@@ -19,16 +19,13 @@ cask "claude-profile-switcher" do
   app "Claude Profile Switcher.app"
 
   caveats <<~EOS
-    This app is ad-hoc signed (no Apple Developer ID), so Gatekeeper blocks
-    the first launch unless you installed with:
-      brew install --cask --no-quarantine claude-profile-switcher
-    Or, after a normal install, either run:
+    This app is ad-hoc signed (no Apple Developer ID), so macOS Gatekeeper
+    blocks the first launch. After installing, either right-click the app in
+    Finder and choose Open (once), or run:
       xattr -d com.apple.quarantine "/Applications/Claude Profile Switcher.app"
-    or right-click the app in Finder and choose Open (once).
 
-    --no-quarantine skips Gatekeeper's first-launch check — only use it for
-    software you trust; you can verify downloads against the SHA256SUMS file
-    attached to each GitHub release.
+    Only do this for software you trust — you can verify downloads against
+    the SHA256SUMS file attached to each GitHub release.
   EOS
 
   zap trash: "~/Library/Application Support/ClaudeProfileSwitcher"
