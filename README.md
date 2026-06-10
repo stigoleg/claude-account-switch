@@ -41,6 +41,12 @@ brew tap stigoleg/tap
 brew install --cask claude-profile-switcher
 ```
 
+Newer Homebrew versions warn that taps outside Homebrew's own are untrusted. The install still works, and you can silence the warning for this cask with a one time:
+
+```bash
+brew trust --cask stigoleg/tap/claude-profile-switcher
+```
+
 There is one extra step before the first launch. The app is ad hoc signed (no paid Apple Developer ID), so macOS quarantines the download and Gatekeeper refuses to open it. Either right click the app in Finder and choose Open, which you only need to do once, or clear the quarantine flag:
 
 ```bash
