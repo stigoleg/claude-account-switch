@@ -113,7 +113,8 @@ struct Dispatcher {
                 let value = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
                 return value.isEmpty ? nil : value
             }
-            let parent = directory.deletingLastPathComponent()
+            if directory.path == "/" { break }
+            let parent = directory.deletingLastPathComponent().standardizedFileURL
             if parent.path == directory.path { break }
             directory = parent
         }
