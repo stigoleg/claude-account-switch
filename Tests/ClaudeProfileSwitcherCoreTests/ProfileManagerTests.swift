@@ -343,7 +343,7 @@ final class ProfileManagerTests: XCTestCase {
 }
 
 @MainActor
-private func assertThrowsErrorAsync<T>(
+private func assertThrowsErrorAsync<T: Sendable>(
     _ expression: @autoclosure () async throws -> T,
     file: StaticString = #filePath,
     line: UInt = #line
