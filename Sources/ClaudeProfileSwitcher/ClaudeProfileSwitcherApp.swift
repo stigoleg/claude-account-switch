@@ -4,13 +4,37 @@ import SwiftUI
 
 @main
 struct ClaudeProfileSwitcherApp: App {
-    @State private var vm = AppViewModel()
+    @State private var vm: AppViewModel
+    private let instanceLock: SingleInstanceLock
+    private let testMode: Bool
+
+    init() {
+        do {
+            let environment = ProcessInfo.processInfo.environment
+            self.testMode = environment["CPS_TEST_ROOT"] != nil
+            let lockURL = environment["CPS_TEST_ROOT"].map {
+                URL(fileURLWithPath: $0).appendingPathComponent("support/app.lock")
+            }
+            self.instanceLock = try SingleInstanceLock(
+                lockFileURL: lockURL ?? ProfileStore.supportDirectory.appendingPathComponent("app.lock"))
+            self._vm = State(initialValue: AppViewModel())
+        } catch {
+            if let existing = NSRunningApplication.runningApplications(
+                withBundleIdentifier: "com.stigole.ClaudeProfileSwitcher"
+            ).first(where: { $0.processIdentifier != getpid() }) {
+                existing.activate(options: [.activateAllWindows])
+            }
+            fputs("\(error.localizedDescription)\n", stderr)
+            exit(EXIT_SUCCESS)
+        }
+    }
 
     var body: some Scene {
         MenuBarExtra {
             MenuBarView(vm: vm)
         } label: {
             menuBarLabel
+                .background(TestModeWindowOpener(enabled: testMode))
         }
         .menuBarExtraStyle(.menu)
 
@@ -28,6 +52,7 @@ struct ClaudeProfileSwitcherApp: App {
             // Manage Profiles won't terminate the whole app any more.
             CommandGroup(replacing: .appTermination) {}
         }
+
     }
 
     /// The menu bar status item label. `MenuBarExtra` is picky about its
@@ -49,6 +74,19 @@ struct ClaudeProfileSwitcherApp: App {
                     .truncationMode(.tail)
             }
         }
+    }
+}
+
+private struct TestModeWindowOpener: View {
+    let enabled: Bool
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .task {
+                if enabled { openWindow(id: "profiles") }
+            }
     }
 }
 

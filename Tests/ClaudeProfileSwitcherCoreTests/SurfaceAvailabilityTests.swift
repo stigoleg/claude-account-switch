@@ -88,6 +88,25 @@ final class SurfaceAvailabilityTests: XCTestCase {
         XCTAssertNil(found)
     }
 
+    func testShellLookupNeverReturnsInstalledDispatcherAsRealClaude() async throws {
+        let (tmp, cleanup) = try TestSupport.makeTempDirectory()
+        defer { cleanup() }
+        let dispatcher = tmp.appendingPathComponent("bin/claude")
+        try FileManager.default.createDirectory(
+            at: dispatcher.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\n".write(to: dispatcher, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: dispatcher.path)
+        let path = dispatcher.path
+        let locator = SystemSurfaceLocator(
+            cliCandidatePaths: [],
+            dispatcherPath: dispatcher,
+            shellLookup: { path })
+
+        let resolved = await locator.cliExecutableURL()
+        XCTAssertNil(resolved)
+    }
+
     // MARK: - SurfaceAvailability observable
 
     func testRefreshTransitionsFromUnknown() async {

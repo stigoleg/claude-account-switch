@@ -10,8 +10,8 @@ DMG_NAME     = ClaudeProfileSwitcher-$(VERSION).dmg
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build debug run test clean install uninstall xcode icon \
-        version release-zip dmg checksums dist lint
+.PHONY: help build debug run test clean install uninstall xcode icon signing-check notarized-dist \
+        version release-zip package-release-zip dmg package-dmg sbom checksums dist dist-from-build lint
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[1m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -35,22 +35,44 @@ test: ## Run unit tests
 lint: ## Lint sources with the toolchain's swift format
 	swift format lint --strict --recursive Sources Tests Package.swift
 
+signing-check: ## Validate Developer ID certificate, Team ID and provisioning profile
+	bash ./Scripts/check-signing.sh
+
+notarized-dist: ## Build, notarize, staple and package a Developer ID release
+	bash ./Scripts/notarize-release.sh
+
 version: ## Print the resolved app version (git tag → version)
 	@./Scripts/version.sh version
 
-release-zip: build ## Zip the .app for distribution (ditto preserves the bundle)
+release-zip: build package-release-zip ## Build and zip the .app for distribution
+
+package-release-zip: ## Zip an existing built app without rebuilding (used after notarization)
 	@mkdir -p $(DIST_DIR)
 	ditto -c -k --sequesterRsrc --keepParent "$(APP_BUNDLE)" "$(DIST_DIR)/$(ZIP_NAME)"
 	@echo "==> $(DIST_DIR)/$(ZIP_NAME)"
 
-dmg: build ## Build a drag-to-Applications .dmg
+dmg: build package-dmg ## Build a drag-to-Applications .dmg
+
+package-dmg: ## Package an existing built app without rebuilding
 	./Scripts/make-dmg.sh "$(APP_BUNDLE)" "$(DIST_DIR)/$(DMG_NAME)"
 
-checksums: ## Write SHA256SUMS for everything in dist/
-	cd $(DIST_DIR) && shasum -a 256 *.zip *.dmg > SHA256SUMS
+sbom: ## Generate an SPDX 2.3 software bill of materials
+	bash ./Scripts/generate-sbom.sh "$(DIST_DIR)/ClaudeProfileSwitcher.spdx.json"
+
+checksums: sbom ## Write SHA256SUMS for everything in dist/
+	cd $(DIST_DIR) && shasum -a 256 "$(ZIP_NAME)" "$(DMG_NAME)" ClaudeProfileSwitcher.spdx.json > SHA256SUMS
 	@cat $(DIST_DIR)/SHA256SUMS
 
-dist: release-zip dmg checksums ## Build all release artifacts into ./dist
+dist: build ## Build all release artifacts into ./dist
+	@$(MAKE) dist-from-build
+
+dist-from-build: ## Package an already built/notarized app
+	@mkdir -p $(DIST_DIR)
+	rm -f "$(DIST_DIR)"/ClaudeProfileSwitcher-*.zip \
+		"$(DIST_DIR)"/ClaudeProfileSwitcher-*.dmg \
+		"$(DIST_DIR)"/ClaudeProfileSwitcher.spdx.json \
+		"$(DIST_DIR)"/SHA256SUMS
+	@$(MAKE) package-release-zip package-dmg checksums
 
 clean: ## Remove build artifacts (.build, ./build, ./dist)
 	rm -rf .build build dist
@@ -62,8 +84,7 @@ install: build ## Install the bundle into /Applications (overwrites existing)
 	fi
 	cp -R "$(APP_BUNDLE)" "$(INSTALL_DIR)/"
 	@echo "==> installed to $(INSTALL_DIR)/$(APP_NAME).app"
-	@echo "    First launch: right-click → Open to bypass Gatekeeper"
-	@echo "    or run: xattr -d com.apple.quarantine \"$(INSTALL_DIR)/$(APP_NAME).app\""
+	@echo "    Production releases must be Developer ID signed and notarized."
 
 uninstall: ## Remove installed bundle; prompt before nuking support dir
 	@if [ -d "$(INSTALL_DIR)/$(APP_NAME).app" ]; then \

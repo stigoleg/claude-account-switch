@@ -19,14 +19,8 @@ cask "claude-profile-switcher" do
   app "Claude Profile Switcher.app"
 
   caveats <<~EOS
-    This app is ad-hoc signed (no Apple Developer ID), so macOS Gatekeeper
-    blocks the first launch. After installing, either right-click the app in
-    Finder and choose Open (once), or run:
-      xattr -d com.apple.quarantine "/Applications/Claude Profile Switcher.app"
-
-    Only do this for software you trust — you can verify downloads against
-    the SHA256SUMS file attached to each GitHub release.
+    Version 2 migrates legacy profiles only after creating a verified APFS
+    copy-on-write backup. Profile data is intentionally retained when the cask
+    is uninstalled; use the app's Disable & Restore action first.
   EOS
-
-  zap trash: "~/Library/Application Support/ClaudeProfileSwitcher"
 end

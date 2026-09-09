@@ -53,20 +53,11 @@ public final class DesktopHintWatcher {
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
             eventMask: [.write, .extend, .rename, .delete],
-            queue: DispatchQueue.global(qos: .utility)
+            queue: .main
         )
         src.setEventHandler { [weak self] in
             Task { @MainActor [weak self] in
                 self?.handleHintChanged()
-            }
-        }
-        src.setCancelHandler { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if self.fileDescriptor >= 0 {
-                    close(self.fileDescriptor)
-                    self.fileDescriptor = -1
-                }
             }
         }
         src.resume()
@@ -108,8 +99,16 @@ public final class DesktopHintWatcher {
         guard contents != lastSeenHint else { return }
         lastSeenHint = contents
 
-        // Look up the profile by name (case-insensitive).
-        guard let profile = store.profiles.first(where: { $0.name.lowercased() == firstLine.lowercased() }) else {
+        let profile: Profile?
+        if let id = UUID(uuidString: firstLine) {
+            profile = store.profiles.first(where: { $0.id == id })
+        } else {
+            profile = store.profiles.first {
+                $0.name.caseInsensitiveCompare(firstLine) == .orderedSame
+                    || $0.aliases.contains { $0.caseInsensitiveCompare(firstLine) == .orderedSame }
+            }
+        }
+        guard let profile else {
             return
         }
         // Already on this profile? Nothing to do.

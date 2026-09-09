@@ -12,6 +12,8 @@ public struct MenuBarView: View {
         if let active = vm.store.activeProfile {
             Text("Active: \(active.name)")
                 .font(.headline)
+            Text("Desktop + new CLI sessions")
+                .font(.caption)
             Divider()
         } else if !vm.store.profiles.isEmpty {
             Text("No profile active")
@@ -31,7 +33,8 @@ public struct MenuBarView: View {
                 }()
                 Text("\(active)\(profile.name)\(suffix)")
             }
-            .disabled(vm.isSwitching)
+            .disabled(vm.isSwitching || vm.localState(for: profile) == .setupRequired)
+            .disabled(vm.layoutHealth != .healthy)
         }
 
         if vm.store.profiles.isEmpty {

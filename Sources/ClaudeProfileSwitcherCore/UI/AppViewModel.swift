@@ -42,6 +42,7 @@ public final class AppViewModel {
     }
     public private(set) var loginStatuses: [UUID: ProfileLoginStatus] = [:]
     public private(set) var shellIntegrationInstalled: Bool = false
+    public var backupVerificationMessage: String?
 
     // Toggle state must live as stored properties so @Observable can track
     // it. The earlier computed-property version wrapped UserDefaults and
@@ -77,20 +78,58 @@ public final class AppViewModel {
         }
     }
 
-    public init() {
-        let s = ProfileStore()
+    public var layoutHealth: LayoutHealth {
+        manager.layout.health(activeProfileID: store.activeProfileID, profiles: store.profiles)
+    }
+
+    public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        let testRoot = environment["CPS_TEST_ROOT"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let s = ProfileStore(supportRoot: testRoot?.appendingPathComponent("support", isDirectory: true))
         s.load()
         self.store = s
-        self.manager = ProfileManager(store: s)
-        self.shellIntegration = ShellIntegrationService(store: s)
-        self.sync = ProfileSyncService(store: s)
+        if let testRoot {
+            let cli = testRoot.appendingPathComponent("home/.claude", isDirectory: true)
+            let desktop = testRoot.appendingPathComponent(
+                "home/Library/Application Support/Claude", isDirectory: true)
+            self.manager = ProfileManager(
+                store: s,
+                claudeApp: TestModeClaudeAppController(),
+                surfaceLocator: TestModeSurfaceLocator(),
+                cliCanonicalPath: cli,
+                desktopCanonicalPath: desktop,
+                claudeCodeRunner: TestModeClaudeCodeRunner())
+            self.shellIntegration = ShellIntegrationService(
+                store: s,
+                configDirectoryOverride: testRoot.appendingPathComponent("config"),
+                zshrcOverride: testRoot.appendingPathComponent("home/.zshrc"),
+                shellIsZshOverride: true,
+                bashrcOverride: testRoot.appendingPathComponent("home/.bashrc"),
+                bashProfileOverride: testRoot.appendingPathComponent("home/.bash_profile"),
+                fishConfigOverride: testRoot.appendingPathComponent(
+                    "home/.config/fish/conf.d/claude-profile-switcher.fish"))
+            self.sync = ProfileSyncService(
+                store: s, cloudDirectory: testRoot.appendingPathComponent("icloud"))
+        } else {
+            self.manager = ProfileManager(store: s)
+            self.shellIntegration = ShellIntegrationService(store: s)
+            self.sync = ProfileSyncService(store: s)
+        }
         self.desktopHint = DesktopHintWatcher(store: s)
-        self.surfaces = SurfaceAvailability()
+        self.surfaces =
+            testRoot == nil
+            ? SurfaceAvailability()
+            : SurfaceAvailability(locator: TestModeSurfaceLocator())
         // Seed the toggle state from UserDefaults. didSet won't fire during
         // init, so we trigger the appropriate watchers/sync explicitly below.
-        self.syncEnabled = UserDefaults.standard.bool(forKey: Self.syncEnabledKey)
-        self.desktopHintsEnabled = UserDefaults.standard.bool(forKey: Self.desktopHintsKey)
+        self.syncEnabled = testRoot == nil && UserDefaults.standard.bool(forKey: Self.syncEnabledKey)
+        self.desktopHintsEnabled = testRoot == nil && UserDefaults.standard.bool(forKey: Self.desktopHintsKey)
 
+        do {
+            try self.manager.recoverLayoutIfNeeded()
+            try self.manager.recoverConfigCopyIfNeeded()
+        } catch {
+            self.lastError = error.localizedDescription
+        }
         if case .needed = manager.migrationState() {
             self.showMigrationSheet = true
         }
@@ -118,10 +157,14 @@ public final class AppViewModel {
             if let err = self.store.lastPersistError {
                 self.reportError(err)
             }
-            self.shellIntegration.writeProfilePathsManifest()
+            if let error = self.shellIntegration.writeProfilePathsManifest() {
+                self.reportError(error)
+            }
             self.sync.localDidChange()
         }
-        shellIntegration.writeProfilePathsManifest()
+        if let error = shellIntegration.writeProfilePathsManifest() {
+            lastError = error
+        }
     }
 
     /// Re-stat every profile's credential files. The file inspection is sync
@@ -134,7 +177,7 @@ public final class AppViewModel {
         // value the moment a credential file appears.
         var next: [UUID: ProfileLoginStatus] = [:]
         for p in store.profiles {
-            next[p.id] = manager.credentials.status(for: p)
+            next[p.id] = manager.credentials.status(for: p, activeProfileID: store.activeProfileID)
         }
         loginStatuses = next
 
@@ -144,7 +187,8 @@ public final class AppViewModel {
         Task { [weak self] in
             var withKeychain: [UUID: ProfileLoginStatus] = [:]
             for p in profiles {
-                withKeychain[p.id] = await inspector.statusWithKeychain(for: p)
+                withKeychain[p.id] = await inspector.statusWithKeychain(
+                    for: p, activeProfileID: self?.store.activeProfileID)
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -154,7 +198,117 @@ public final class AppViewModel {
     }
 
     public func refreshShellIntegrationState() {
-        shellIntegrationInstalled = shellIntegration.isInstalledInZshrc()
+        shellIntegrationInstalled =
+            shellIntegration.integrationStatuses().allSatisfy(\.installed)
+            && shellIntegration.dispatcherSignatureValid()
+    }
+
+    public var cliIntegrationStatuses: [CLIIntegrationStatus] {
+        shellIntegration.integrationStatuses()
+    }
+
+    public var latestBackup: MigrationBackup? {
+        manager.layout.availableBackups().first
+    }
+
+    public var syncStatusText: String {
+        switch sync.status {
+        case .disabled: return "iCloud sync disabled"
+        case .syncing: return "iCloud sync in progress"
+        case .current: return "iCloud metadata current"
+        case .offline(let message): return "iCloud offline: \(message)"
+        case .failed(let message): return "iCloud sync failed: \(message)"
+        }
+    }
+
+    public var pendingRemoteDeletionProfiles: [Profile] {
+        store.profiles.filter { sync.pendingRemoteDeletions.contains($0.id) }
+    }
+
+    public func keepPendingRemoteProfile(_ profile: Profile) {
+        do {
+            _ = try manager.keepOnThisMac(profile)
+            sync.resolvePendingRemoteDeletion(for: profile.id)
+            refreshLoginStatuses()
+        } catch {
+            reportError(error.localizedDescription)
+        }
+    }
+
+    public func acceptPendingRemoteDeletion(_ profile: Profile) {
+        guard profile.id != store.activeProfileID else {
+            reportError("Switch to another profile before accepting deletion of “\(profile.name)”.")
+            return
+        }
+        do {
+            try manager.delete(profile)
+            sync.resolvePendingRemoteDeletion(for: profile.id)
+            refreshLoginStatuses()
+        } catch {
+            reportError(error.localizedDescription)
+        }
+    }
+
+    public func verifyLatestBackup() {
+        guard let backup = latestBackup else { return }
+        let layout = manager.layout
+        Task { [weak self] in
+            do {
+                let valid = try await Task.detached(priority: .utility) {
+                    try layout.verifyBackup(backup)
+                }.value
+                self?.backupVerificationMessage = valid ? "Backup verified" : "Backup verification failed"
+            } catch {
+                self?.backupVerificationMessage = "Backup verification failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    public func revealLatestBackup() {
+        guard let backup = latestBackup else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([backup.directory])
+    }
+
+    public func requestRestoreLatestBackup() {
+        guard let backup = latestBackup else { return }
+        let alert = NSAlert()
+        alert.messageText = "Restore the verified pre-v2 backup?"
+        alert.informativeText =
+            "Claude Desktop and all Claude Code sessions must be closed. Current profile data will be retained in a new pre-restore backup, and the selected backup will be restored into the safe v2 physical layout. iCloud sync will be disabled until you turn it on again."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Restore Backup")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        syncEnabled = false
+        runExclusive { [self] in
+            try await manager.restorePreV2Backup(backup)
+            if let error = shellIntegration.writeProfilePathsManifest() {
+                throw ShellIntegrationService.IntegrationError.manifest(error)
+            }
+            refreshLoginStatuses()
+            backupVerificationMessage = "Backup restored; previous v2 data was retained"
+        }
+    }
+
+    public func requestTrashLatestBackup() {
+        guard let backup = latestBackup else { return }
+        let alert = NSAlert()
+        alert.messageText = "Move the pre-v2 backup to the Trash?"
+        alert.informativeText =
+            "This removes your automatic rollback point. The backup is moved to the Trash and is not permanently erased."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try manager.layout.moveBackupToTrash(backup)
+            backupVerificationMessage = "Backup moved to Trash"
+        } catch {
+            reportError(error.localizedDescription)
+        }
     }
 
     public func status(for profile: Profile) -> ProfileLoginStatus {
@@ -184,12 +338,23 @@ public final class AppViewModel {
     // MARK: - Actions
 
     public func performMigration() {
-        do {
-            try manager.runFirstRunMigration()
+        runExclusive { [self] in
+            try await manager.runFirstRunMigrationAsync()
             showMigrationSheet = false
-            shellIntegration.writeProfilePathsManifest()
-        } catch {
-            reportError(error.localizedDescription)
+            do {
+                try shellIntegration.installAllSupportedShells()
+                try await manager.logoutLegacyGlobalCLI()
+            } catch {
+                reportError(
+                    "Your profile data was migrated safely, but CLI setup still needs attention: \(error.localizedDescription)"
+                )
+            }
+            if let manifestError = shellIntegration.writeProfilePathsManifest() {
+                reportError("CLI manifest needs repair: \(manifestError)")
+            }
+            refreshLoginStatuses()
+            refreshShellIntegrationState()
+            pendingSignInProfile = store.activeProfile
         }
     }
 
@@ -203,6 +368,20 @@ public final class AppViewModel {
         }
     }
 
+    public func setupLocalProfile(_ profile: Profile) {
+        do {
+            try manager.setupLocalProfile(profile)
+            refreshLoginStatuses()
+            pendingSignInProfile = profile
+        } catch {
+            reportError(error.localizedDescription)
+        }
+    }
+
+    public func localState(for profile: Profile) -> LocalProfileState {
+        manager.layout.localState(for: profile, activeProfileID: store.activeProfileID)
+    }
+
     public func rename(_ profile: Profile, to name: String) {
         do {
             try manager.rename(profile, to: name)
@@ -212,7 +391,11 @@ public final class AppViewModel {
     }
 
     public func setColor(_ profile: Profile, hex: String) {
-        manager.setColor(profile, hex: hex)
+        do {
+            try manager.setColor(profile, hex: hex)
+        } catch {
+            reportError(error.localizedDescription)
+        }
     }
 
     public func delete(_ profile: Profile) {
@@ -266,24 +449,21 @@ public final class AppViewModel {
         runExclusive { [self] in
             defer {
                 refreshLoginStatuses()
-                // ~/.claude/local/claude resolves through the profile symlink,
-                // so CLI availability can change across a switch.
+                // Refresh after profile changes in case the available real
+                // Claude binary came from a profile-local installation.
                 surfaces.refreshSoon(force: true)
             }
-            do {
-                try await manager.switchTo(profile, relaunchDesktop: relaunchDesktop)
-            } catch let error as ClaudeAppError {
-                // The switch itself committed — only the Desktop relaunch failed.
+            let result = try await manager.switchTo(profile, relaunchDesktop: relaunchDesktop)
+            if let relaunchError = result.relaunchError {
                 reportError(
-                    "Switched to “\(profile.name)”, but Claude Desktop couldn't be reopened: \(error.localizedDescription)"
+                    "Switched to “\(profile.name)”, but Claude Desktop couldn't be reopened: \(relaunchError)"
                 )
             }
         }
     }
 
-    /// Confirms with the user, then tears down the symlinks and moves the
-    /// active profile's data back to the canonical paths. Optionally quits
-    /// the app afterward.
+    /// Confirms with the user, then restores stock Desktop/CLI paths while
+    /// retaining other profiles and backups. Optionally quits afterward.
     public func requestDisableAndRestore() {
         guard let active = store.activeProfile else {
             reportError("There is no active profile to restore.")
@@ -293,7 +473,7 @@ public final class AppViewModel {
         let alert = NSAlert()
         alert.messageText = "Restore the default Claude layout?"
         alert.informativeText =
-            "This removes the symlinks at ~/.claude and ~/Library/Application Support/Claude, and moves \"\(active.name)\"'s files back into those paths. Other profiles stay on disk but become inactive. Claude Desktop will be quit first."
+            "Claude Desktop stays in its real support folder. \"\(active.name)\"'s CLI files move back to ~/.claude, managed shell hooks are removed, and other profiles and backups stay on disk. Claude Desktop will be quit first."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Restore and Quit App")
         alert.addButton(withTitle: "Restore (keep app running)")
@@ -305,8 +485,12 @@ public final class AppViewModel {
 
         runExclusive { [self] in
             try await manager.disableAndRestore(targetProfile: active)
+            try shellIntegration.uninstallAllSupportedShells()
             refreshLoginStatuses()
-            shellIntegration.writeProfilePathsManifest()
+            refreshShellIntegrationState()
+            reportError(
+                "The default layout was restored and the managed shell hooks were removed. Run `claude auth login` in a new terminal to create a global CLI login. Your other profiles and backups remain on disk."
+            )
             if quitAfter { NSApp.terminate(nil) }
         }
     }
@@ -412,7 +596,7 @@ public final class AppViewModel {
 
     public func installShellIntegration() {
         do {
-            try shellIntegration.install()
+            try shellIntegration.installAllSupportedShells()
             refreshShellIntegrationState()
         } catch {
             reportError("Couldn't install shell integration: \(error.localizedDescription)")
@@ -421,7 +605,7 @@ public final class AppViewModel {
 
     public func uninstallShellIntegration() {
         do {
-            try shellIntegration.uninstall()
+            try shellIntegration.uninstallAllSupportedShells()
             refreshShellIntegrationState()
         } catch {
             reportError("Couldn't uninstall shell integration: \(error.localizedDescription)")
@@ -441,10 +625,13 @@ public final class AppViewModel {
         do {
             try sync.start { [weak self] in
                 self?.refreshLoginStatuses()
+                if let self, let error = self.shellIntegration.writeProfilePathsManifest() {
+                    self.reportError(error)
+                }
             }
         } catch {
             reportError("iCloud Drive sync couldn't start: \(error.localizedDescription)")
-            UserDefaults.standard.set(false, forKey: Self.syncEnabledKey)
+            syncEnabled = false
         }
     }
 

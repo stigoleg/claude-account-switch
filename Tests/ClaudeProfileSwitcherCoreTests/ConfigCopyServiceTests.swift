@@ -65,7 +65,9 @@ final class ConfigCopyServiceTests: XCTestCase {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         return Harness(
-            svc: ConfigCopyService(trash: recorder.closure()),
+            svc: ConfigCopyService(
+                recoveryDirectory: tmp.appendingPathComponent("copy-recovery"),
+                trash: recorder.closure()),
             srcCLI: dirs[0], srcDesk: dirs[1], tgtCLI: dirs[2], tgtDesk: dirs[3],
             trashed: recorder, cleanup: cleanup)
     }
@@ -485,5 +487,55 @@ final class ConfigCopyServiceTests: XCTestCase {
                 return XCTFail("expected sourceEqualsTarget, got \(error)")
             }
         }
+    }
+
+    func testExecuteRejectsPlanWhenSourceChangesAfterPreview() throws {
+        let h = try makeHarness()
+        defer { h.cleanup() }
+        try write("before", to: h.srcCLI.appendingPathComponent("settings.json"))
+        let p = try plan(h, categories: [.cliSettings], mode: .merge)
+        try write("after", to: h.srcCLI.appendingPathComponent("settings.json"))
+
+        XCTAssertThrowsError(try h.svc.execute(p)) { error in
+            guard case ConfigCopyError.stalePlan = error else {
+                return XCTFail("expected stalePlan, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: h.tgtCLI.appendingPathComponent("settings.json").path))
+    }
+
+    func testPlanFlagsPotentialSecretsWithoutExposingValues() throws {
+        let h = try makeHarness()
+        defer { h.cleanup() }
+        try writeJSON(
+            ["env": ["ANTHROPIC_API_KEY": "super-secret-value"]],
+            to: h.srcCLI.appendingPathComponent("settings.json"))
+        let p = try plan(h, categories: [.cliSettings], mode: .merge)
+        XCTAssertTrue(p.containsPotentialSecrets)
+    }
+
+    func testPendingCopyJournalRollsBackAfterSimulatedProcessCrash() throws {
+        struct Entry: Codable { let target: URL; let backup: URL? }
+        struct Snapshot: Codable { let root: URL; let entries: [Entry] }
+
+        let (root, cleanup) = try TestSupport.makeTempDirectory()
+        defer { cleanup() }
+        let recovery = root.appendingPathComponent("recovery")
+        let transaction = recovery.appendingPathComponent("transaction-crashed")
+        try fm.createDirectory(at: transaction, withIntermediateDirectories: true)
+        let target = root.appendingPathComponent("profile/settings.json")
+        let backup = transaction.appendingPathComponent("0")
+        try write("before", to: target)
+        try fm.copyItem(at: target, to: backup)
+        try write("half-written", to: target)
+        let snapshot = Snapshot(root: transaction, entries: [Entry(target: target, backup: backup)])
+        try JSONEncoder().encode(snapshot).write(to: recovery.appendingPathComponent("pending.json"))
+        let service = ConfigCopyService(recoveryDirectory: recovery)
+
+        try service.recoverPendingCopy()
+
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "before")
+        XCTAssertFalse(fm.fileExists(atPath: recovery.appendingPathComponent("pending.json").path))
+        XCTAssertFalse(fm.fileExists(atPath: transaction.path))
     }
 }

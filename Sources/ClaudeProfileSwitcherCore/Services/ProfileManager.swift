@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 public enum MigrationState: Equatable {
-    case notNeeded  // both canonical paths are already symlinks (or absent)
+    case notNeeded
     case needed(cliRealDir: Bool, desktopRealDir: Bool)
 }
 
@@ -69,6 +69,8 @@ public final class ProfileManager {
     public let surfaceLocator: any SurfaceLocator
     /// Profile-to-profile configuration copy (MCP servers, plugins, skills…).
     public let configCopy: ConfigCopyService
+    public let layout: any ProfileLayoutServicing
+    public let claudeCodeRunner: any ClaudeCodeRunning
     /// Path of the CLI canonical mount point (`~/.claude` in prod). Injectable
     /// so tests can drive migration against a tmp dir without touching real
     /// user data.
@@ -81,192 +83,220 @@ public final class ProfileManager {
         symlinks: any SymlinkServicing = SymlinkService(),
         claudeApp: any ClaudeAppControlling = ClaudeAppController(),
         surfaceLocator: any SurfaceLocator = SystemSurfaceLocator(),
-        configCopy: ConfigCopyService = ConfigCopyService(),
+        configCopy: ConfigCopyService? = nil,
         cliCanonicalPath: URL = ProfileStore.claudeCLIPath,
-        desktopCanonicalPath: URL = ProfileStore.claudeDesktopPath
+        desktopCanonicalPath: URL = ProfileStore.claudeDesktopPath,
+        layout: (any ProfileLayoutServicing)? = nil,
+        claudeCodeRunner: (any ClaudeCodeRunning)? = nil
     ) {
         self.store = store
         self.symlinks = symlinks
         self.claudeApp = claudeApp
         self.surfaceLocator = surfaceLocator
-        self.configCopy = configCopy
-        self.credentials = CredentialsInspector(store: store)
+        self.configCopy =
+            configCopy
+            ?? ConfigCopyService(
+                recoveryDirectory: store.supportDirectory.appendingPathComponent(
+                    "CopyConfigRecovery", isDirectory: true))
+        let runner =
+            claudeCodeRunner
+            ?? ClaudeCodeRunner(
+                candidates: store.profiles.map {
+                    store.cliDirectory($0).appendingPathComponent("local/claude")
+                } + SystemSurfaceLocator.defaultCandidatePaths())
+        self.claudeCodeRunner = runner
+        self.credentials = CredentialsInspector(
+            store: store,
+            canonicalDesktopPath: desktopCanonicalPath,
+            claudeCodeRunner: runner)
         self.cliCanonicalPath = cliCanonicalPath
         self.desktopCanonicalPath = desktopCanonicalPath
+        self.layout =
+            layout
+            ?? ProfileLayoutService(
+                store: store,
+                canonicalDesktop: desktopCanonicalPath,
+                canonicalCLI: cliCanonicalPath)
     }
 
     // MARK: - Migration
 
     /// Inspect the canonical paths and report whether first-run migration is needed.
     public func migrationState() -> MigrationState {
+        switch layout.health(activeProfileID: store.activeProfileID, profiles: store.profiles) {
+        case .healthy:
+            return .notNeeded
+        case .migrationRequired, .recoveryRequired, .unsupportedFilesystem:
+            break
+        }
         let cliReal = symlinks.itemExists(cliCanonicalPath) && !symlinks.isSymlink(cliCanonicalPath)
         let desktopReal = symlinks.itemExists(desktopCanonicalPath) && !symlinks.isSymlink(desktopCanonicalPath)
-        if !cliReal && !desktopReal { return .notNeeded }
+        if !cliReal && !desktopReal,
+            !symlinks.isSymlink(cliCanonicalPath),
+            !symlinks.isSymlink(desktopCanonicalPath)
+        {
+            return .notNeeded
+        }
         return .needed(cliRealDir: cliReal, desktopRealDir: desktopReal)
     }
 
-    /// Move existing real directories into a freshly-created "default" profile and
-    /// replace the originals with symlinks. Idempotent — safe to call again later;
-    /// it just won't do anything if both paths are already symlinks.
-    ///
-    /// **Atomicity**: both destination conflicts are checked before any data is
-    /// moved. If an I/O failure still hits the Desktop half after the CLI half
-    /// committed (or the symlink flip fails after a move), the completed steps
-    /// are undone in reverse so the user can retry from a clean state.
+    /// Back up and convert a stock or v1 symlink installation to the v2 physical
+    /// Desktop layout. Every mutating step is journaled and recoverable.
     public func runFirstRunMigration(profileName: String = "default") throws {
-        // Reuse an existing "default" profile if the user already created one.
-        let existing = store.profiles.first { $0.name.lowercased() == profileName.lowercased() }
-        let profile = existing ?? Profile(name: profileName)
-        let cliDst = store.cliDirectory(profile)
-        let desktopDst = store.desktopDirectory(profile)
-
-        let cliIsReal = symlinks.itemExists(cliCanonicalPath) && !symlinks.isSymlink(cliCanonicalPath)
-        let desktopIsReal = symlinks.itemExists(desktopCanonicalPath) && !symlinks.isSymlink(desktopCanonicalPath)
-
-        // Preflight both halves before touching anything so a conflict on the
-        // Desktop side can't surface after the CLI side already moved data.
-        if cliIsReal, symlinks.itemExists(cliDst) {
-            throw ProfileError.migrationConflict(
-                "\(cliDst.path) already exists. Move it aside and try again.")
-        }
-        if desktopIsReal, symlinks.itemExists(desktopDst) {
-            throw ProfileError.migrationConflict(
-                "\(desktopDst.path) already exists. Move it aside and try again.")
+        guard !claudeApp.isClaudeRunning else { throw ProfileLayoutError.desktopStillRunning }
+        try preflightLegacyCLIProcesses()
+        if symlinks.isSymlink(cliCanonicalPath), symlinks.isSymlink(desktopCanonicalPath) {
+            guard let active = store.activeProfile else { throw ProfileError.noProfilesYet }
+            _ = try layout.createPreV2Backup(profiles: store.profiles)
+            try layout.migrateLegacyLayout(active: active, profiles: store.profiles)
+            try store.setActiveThrowing(active)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: converted legacy symlink layout for \(active.name) (\(active.id))")
+            return
         }
 
-        try symlinks.ensureDirectory(store.profileDirectory(profile))
-
-        // CLI half — record prior state so any later failure can undo it.
-        let prevCLISymlinkTarget = symlinks.symlinkDestination(cliCanonicalPath)
-        var cliWasMoved = false
-        func rollbackCLI() {
-            if cliWasMoved {
-                try? symlinks.removeSymlink(at: cliCanonicalPath)
-                try? symlinks.moveDirectory(from: cliDst, to: cliCanonicalPath)
-            } else if let prevCLISymlinkTarget {
-                try? symlinks.replaceSymlink(at: cliCanonicalPath, pointingTo: prevCLISymlinkTarget)
-            } else {
-                // Canonical path was absent before — restore "absent".
-                try? symlinks.removeSymlink(at: cliCanonicalPath)
-            }
+        // Fresh v2 adoption: keep Desktop at its canonical real path and move
+        // the existing CLI directory into the default profile. No symlinks are
+        // created for either surface.
+        if store.profiles.isEmpty {
+            let profile = Profile(name: try Self.normalizeProfileName(profileName))
+            _ = try layout.createPreV2Backup(profiles: [])
+            try store.upsertThrowing(profile)
+            try layout.adoptCurrentLayout(active: profile)
+            try store.setActiveThrowing(profile)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: adopted default layout as \(profile.name) (\(profile.id))")
+            return
         }
 
-        if cliIsReal {
-            try symlinks.moveDirectory(from: cliCanonicalPath, to: cliDst)
-            cliWasMoved = true
-        } else if !symlinks.itemExists(cliDst) {
-            try symlinks.ensureDirectory(cliDst)
-        }
-        do {
-            try symlinks.replaceSymlink(at: cliCanonicalPath, pointingTo: cliDst)
-        } catch {
-            rollbackCLI()
-            throw ProfileError.migrationConflict(
-                "Migration failed and was rolled back: \(error.localizedDescription)")
+        if let disabledID = store.disabledProfileID,
+            let profile = store.profiles.first(where: { $0.id == disabledID })
+        {
+            _ = try layout.createPreV2Backup(profiles: store.profiles)
+            try layout.adoptCurrentLayout(active: profile)
+            try store.setActiveThrowing(profile)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: re-enabled profile \(profile.name) (\(profile.id))")
+            return
         }
 
-        // Desktop half — on failure, undo it and the CLI half.
-        var desktopWasMoved = false
-        do {
-            if desktopIsReal {
-                try symlinks.moveDirectory(from: desktopCanonicalPath, to: desktopDst)
-                desktopWasMoved = true
-            } else if !symlinks.itemExists(desktopDst) {
-                try symlinks.ensureDirectory(desktopDst)
-            }
-            try symlinks.replaceSymlink(at: desktopCanonicalPath, pointingTo: desktopDst)
-        } catch {
-            if desktopWasMoved, !symlinks.itemExists(desktopCanonicalPath) {
-                try? symlinks.moveDirectory(from: desktopDst, to: desktopCanonicalPath)
-            }
-            rollbackCLI()
-            throw ProfileError.migrationConflict(
-                "Migration failed and was rolled back: \(error.localizedDescription)")
-        }
+        throw ProfileError.migrationConflict(
+            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Health & Recovery."
+        )
 
-        if existing == nil { store.upsert(profile) }
-        store.setActive(profile)
-        store.appendLog("migration: moved into profile \(profile.name) (\(profile.id))")
     }
 
-    /// The inverse of `runFirstRunMigration`. Removes the symlinks at the
-    /// canonical paths and moves the chosen profile's CLI and Desktop
-    /// directories back into place. After this, Claude reads/writes the real
-    /// directories directly again — the app is "out of the way."
-    ///
-    /// The profile entry is **not** deleted; the user can re-migrate later.
-    /// We also clear `activeProfileID` so the UI reflects "no active profile"
-    /// and the first-run migration sheet appears again on next launch.
-    ///
-    /// **Atomicity**: pre-flight checks reject before any mutation. If the
-    /// Desktop half fails after the CLI half succeeded, we roll the CLI back
-    /// into the profile dir so the user is never left half-restored. Worst
-    /// case the user sees a clear error and can retry.
+    /// UI variant that performs the potentially large copy-on-write backup off
+    /// the main actor, then commits the short rename-based layout conversion.
+    public func runFirstRunMigrationAsync(profileName: String = "default") async throws {
+        guard !claudeApp.isClaudeRunning else { throw ProfileLayoutError.desktopStillRunning }
+        try preflightLegacyCLIProcesses()
+        let profiles = store.profiles
+        let layout = self.layout
+        if symlinks.isSymlink(cliCanonicalPath), symlinks.isSymlink(desktopCanonicalPath) {
+            guard let active = store.activeProfile else { throw ProfileError.noProfilesYet }
+            _ = try await Task.detached(priority: .userInitiated) {
+                try layout.createPreV2Backup(profiles: profiles)
+            }.value
+            try layout.migrateLegacyLayout(active: active, profiles: profiles)
+            try store.setActiveThrowing(active)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: converted legacy symlink layout for \(active.name) (\(active.id))")
+            return
+        }
+        if profiles.isEmpty {
+            let profile = Profile(name: try Self.normalizeProfileName(profileName))
+            _ = try await Task.detached(priority: .userInitiated) {
+                try layout.createPreV2Backup(profiles: [])
+            }.value
+            try store.upsertThrowing(profile)
+            try layout.adoptCurrentLayout(active: profile)
+            try store.setActiveThrowing(profile)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: adopted default layout as \(profile.name) (\(profile.id))")
+            return
+        }
+        if let disabledID = store.disabledProfileID,
+            let profile = profiles.first(where: { $0.id == disabledID })
+        {
+            _ = try await Task.detached(priority: .userInitiated) {
+                try layout.createPreV2Backup(profiles: profiles)
+            }.value
+            try layout.adoptCurrentLayout(active: profile)
+            try store.setActiveThrowing(profile)
+            try layout.completeSwitchJournal()
+            store.appendLog("migration-v2: re-enabled profile \(profile.name) (\(profile.id))")
+            return
+        }
+        throw ProfileError.migrationConflict(
+            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Health & Recovery."
+        )
+    }
+
+    @discardableResult
+    public func recoverLayoutIfNeeded() throws -> UUID? {
+        guard let outcome = try layout.recoverPendingOperation() else { return nil }
+        let recoveredID: UUID
+        switch outcome {
+        case .active(let id), .disabled(let id), .restoredBackup(let id): recoveredID = id
+        }
+        if case .restoredBackup = outcome {
+            store.load()
+        }
+        guard let recovered = store.profiles.first(where: { $0.id == recoveredID }) else {
+            throw ProfileLayoutError.pendingRecovery("the recovered profile is missing from metadata")
+        }
+        switch outcome {
+        case .active:
+            try store.setActiveThrowing(recovered)
+            store.appendLog("recovery: active Desktop profile is \(recovered.name) (\(recovered.id))")
+        case .disabled:
+            try store.markDisabledThrowing(recovered)
+            store.appendLog("recovery: completed default-layout restore for \(recovered.name) (\(recovered.id))")
+        case .restoredBackup:
+            guard store.activeProfileID == recovered.id else {
+                throw ProfileLayoutError.pendingRecovery("restored metadata does not select the restored profile")
+            }
+            store.appendLog("recovery: restored pre-v2 backup with active profile \(recovered.name)")
+        }
+        try layout.completeSwitchJournal()
+        return recoveredID
+    }
+
+    /// Restore stock behavior while retaining every profile and backup. Desktop
+    /// is already real in v2; the selected CLI data returns to ~/.claude.
     public func disableAndRestore(targetProfile: Profile) async throws {
         guard store.profiles.contains(where: { $0.id == targetProfile.id }) else {
             throw ProfileError.profileNotFound
         }
 
-        let cliCanonical = cliCanonicalPath
-        let desktopCanonical = desktopCanonicalPath
-        let cliSrc = store.cliDirectory(targetProfile)
-        let desktopSrc = store.desktopDirectory(targetProfile)
-
-        // Pre-flight: both canonical paths must be either absent or symlinks,
-        // and the profile source dirs must exist (otherwise we have nothing
-        // to restore and the user is probably looking at the wrong profile).
-        try preflightRestore(canonicalPaths: [cliCanonical, desktopCanonical])
-
         if claudeApp.isClaudeRunning {
-            _ = await claudeApp.quitClaude()
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
-
-        // CLI side.
-        let originalCLISymlinkTarget = symlinks.symlinkDestination(cliCanonical)
-        if symlinks.isSymlink(cliCanonical) {
-            try symlinks.removeSymlink(at: cliCanonical)
-        }
-        let cliWasMoved = symlinks.itemExists(cliSrc)
-        if cliWasMoved {
-            try symlinks.moveDirectory(from: cliSrc, to: cliCanonical)
-        }
-
-        // Desktop side. If anything below throws, undo the CLI half so the
-        // user can retry from a clean state.
-        do {
-            if symlinks.isSymlink(desktopCanonical) {
-                try symlinks.removeSymlink(at: desktopCanonical)
-            }
-            if symlinks.itemExists(desktopSrc) {
-                try symlinks.moveDirectory(from: desktopSrc, to: desktopCanonical)
-            }
-        } catch {
-            // Roll CLI back.
-            if cliWasMoved, symlinks.itemExists(cliCanonical), !symlinks.isSymlink(cliCanonical) {
-                try? symlinks.moveDirectory(from: cliCanonical, to: cliSrc)
-            }
-            if let target = originalCLISymlinkTarget {
-                try? symlinks.replaceSymlink(at: cliCanonical, pointingTo: target)
-            }
-            throw ProfileError.migrationConflict(
-                "Desktop restore failed and the CLI half was rolled back: \(error.localizedDescription)")
-        }
-
-        store.clearActive()
+        try layout.restoreDefaultLayout(active: targetProfile)
+        try store.markDisabledThrowing(targetProfile)
+        try layout.completeSwitchJournal()
         store.appendLog("restore: \(targetProfile.name) (\(targetProfile.id))")
     }
 
-    /// Verifies that the canonical paths are either absent or symlinks before
-    /// we touch anything. Throws a clear error if a real directory is in the
-    /// way — that means the user already has Claude data outside this app and
-    /// removing it could destroy work.
-    private func preflightRestore(canonicalPaths: [URL]) throws {
-        for path in canonicalPaths {
-            if symlinks.itemExists(path), !symlinks.isSymlink(path) {
-                throw ProfileError.migrationConflict(
-                    "\(path.path) is a real directory, not a symlink — refusing to overwrite. Resolve manually first.")
-            }
+    public func restorePreV2Backup(_ backup: MigrationBackup) async throws {
+        if claudeApp.isClaudeRunning {
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
+        try preflightLegacyCLIProcesses()
+        let restoredID = try layout.restorePreV2Backup(backup, currentActiveID: store.activeProfileID)
+        store.load()
+        guard store.activeProfileID == restoredID,
+            let restored = store.profiles.first(where: { $0.id == restoredID })
+        else {
+            throw ProfileLayoutError.pendingRecovery("restored metadata could not be loaded")
+        }
+        try layout.completeSwitchJournal()
+        store.appendLog("restore-backup: \(backup.directory.lastPathComponent), active \(restored.name)")
+    }
+
+    public func recoverConfigCopyIfNeeded() throws {
+        try configCopy.recoverPendingCopy()
     }
 
     // MARK: - CRUD
@@ -291,33 +321,47 @@ public final class ProfileManager {
     @discardableResult
     public func createProfile(name: String) throws -> Profile {
         let trimmed = try Self.normalizeProfileName(name)
-        if store.profiles.contains(where: { $0.name.lowercased() == trimmed.lowercased() }) {
+        if store.profiles.contains(where: {
+            $0.name.caseInsensitiveCompare(trimmed) == .orderedSame
+                || $0.aliases.contains { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
+        }) {
             throw ProfileError.nameTaken(trimmed)
         }
         let profile = Profile(name: trimmed)
-        try symlinks.ensureDirectory(store.cliDirectory(profile))
-        try symlinks.ensureDirectory(store.desktopDirectory(profile))
-        store.upsert(profile)
+        try layout.prepareNewProfile(profile)
+        try store.upsertThrowing(profile)
         store.appendLog("create: \(profile.name) (\(profile.id))")
         return profile
+    }
+
+    public func setupLocalProfile(_ profile: Profile) throws {
+        guard store.profiles.contains(where: { $0.id == profile.id }) else {
+            throw ProfileError.profileNotFound
+        }
+        try layout.prepareNewProfile(profile)
+        store.appendLog("setup-local: \(profile.name) (\(profile.id))")
     }
 
     /// Change the display color of a profile. Persists immediately so the
     /// sync layer can pick it up; the iCloud merge treats this like any other
     /// edit (last-writer-wins on `updatedAt`).
-    public func setColor(_ profile: Profile, hex: String) {
+    public func setColor(_ profile: Profile, hex: String) throws {
         var updated = profile
         updated.colorHex = hex
-        store.upsert(updated)
+        try store.upsertThrowing(updated)
         store.appendLog("color: \(profile.id) -> \(hex)")
     }
 
     public func rename(_ profile: Profile, to newName: String) throws {
         let trimmed = try Self.normalizeProfileName(newName)
-        if store.profiles.contains(where: { $0.id != profile.id && $0.name.lowercased() == trimmed.lowercased() }) {
+        if store.profiles.contains(where: {
+            $0.id != profile.id
+                && ($0.name.caseInsensitiveCompare(trimmed) == .orderedSame
+                    || $0.aliases.contains { $0.caseInsensitiveCompare(trimmed) == .orderedSame })
+        }) {
             throw ProfileError.nameTaken(trimmed)
         }
-        store.renameProfile(profile, to: trimmed)
+        try store.renameProfileThrowing(profile, to: trimmed)
         store.appendLog("rename: \(profile.id) -> \(trimmed)")
     }
 
@@ -330,63 +374,73 @@ public final class ProfileManager {
         if symlinks.itemExists(dir) {
             try symlinks.trashProfileDirectory(dir)
         }
-        store.remove(profile)
+        try store.removeThrowing(profile)
         store.appendLog("delete: \(profile.name) (\(profile.id))")
+    }
+
+    /// Preserve local bytes after iCloud tombstoned the old profile ID. The
+    /// directory is renamed on the same volume and metadata is committed as a
+    /// new UUID; failures roll the directory identity back.
+    @discardableResult
+    public func keepOnThisMac(_ profile: Profile) throws -> Profile {
+        guard store.profiles.contains(where: { $0.id == profile.id }) else {
+            throw ProfileError.profileNotFound
+        }
+        let replacement = Profile(
+            name: profile.name,
+            colorHex: profile.colorHex,
+            createdAt: profile.createdAt,
+            aliases: profile.aliases)
+        let wasActive = store.activeProfileID == profile.id
+        try layout.reassignLocalProfileData(from: profile, to: replacement, active: wasActive)
+        do {
+            try store.replaceProfileIDThrowing(from: profile, with: replacement)
+        } catch {
+            try layout.reassignLocalProfileData(from: replacement, to: profile, active: wasActive)
+            throw error
+        }
+        store.appendLog("sync-keep-local: \(profile.name) \(profile.id) -> \(replacement.id)")
+        return replacement
     }
 
     // MARK: - Switch
 
     /// Switch the active profile. Quits Claude Desktop first; relaunches when requested.
-    public func switchTo(_ profile: Profile, relaunchDesktop: Bool) async throws {
+    @discardableResult
+    public func switchTo(_ profile: Profile, relaunchDesktop: Bool) async throws -> SwitchResult {
         guard store.profiles.contains(where: { $0.id == profile.id }) else {
             throw ProfileError.profileNotFound
         }
-        if store.activeProfileID == profile.id { return }
+        if store.activeProfileID == profile.id {
+            return SwitchResult(switched: false, desktopRelaunched: false)
+        }
 
-        let cliDst = store.cliDirectory(profile)
-        let desktopDst = store.desktopDirectory(profile)
-        try symlinks.ensureDirectory(cliDst)
-        try symlinks.ensureDirectory(desktopDst)
+        guard case .healthy = layout.health(activeProfileID: store.activeProfileID, profiles: store.profiles) else {
+            throw ProfileLayoutError.migrationRequired
+        }
+        guard let previous = store.activeProfile else { throw ProfileLayoutError.noActiveProfile }
 
         let wasRunning = claudeApp.isClaudeRunning
         if wasRunning {
-            _ = await claudeApp.quitClaude()
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
-
-        // Capture previous targets so we can roll back the symlinks if the second
-        // swap fails midway through.
-        let prevCLI = symlinks.symlinkDestination(cliCanonicalPath)
-        let prevDesktop = symlinks.symlinkDestination(desktopCanonicalPath)
-
-        do {
-            try symlinks.replaceSymlink(at: cliCanonicalPath, pointingTo: cliDst)
-            try symlinks.replaceSymlink(at: desktopCanonicalPath, pointingTo: desktopDst)
-        } catch {
-            // Best-effort rollback. When no previous target was captured the
-            // canonical path was absent before the switch — restore "absent"
-            // rather than leaving a half-flipped pair behind.
-            if let prevCLI {
-                try? symlinks.replaceSymlink(at: cliCanonicalPath, pointingTo: prevCLI)
-            } else if symlinks.isSymlink(cliCanonicalPath) {
-                try? symlinks.removeSymlink(at: cliCanonicalPath)
-            }
-            if let prevDesktop {
-                try? symlinks.replaceSymlink(at: desktopCanonicalPath, pointingTo: prevDesktop)
-            } else if symlinks.isSymlink(desktopCanonicalPath) {
-                try? symlinks.removeSymlink(at: desktopCanonicalPath)
-            }
-            throw error
-        }
-
-        store.setActive(profile)
+        try layout.switchDesktop(from: previous, to: profile)
+        try store.setActiveThrowing(profile)
+        try layout.completeSwitchJournal()
         store.appendLog("switch: -> \(profile.name) (\(profile.id))")
 
         if relaunchDesktop, wasRunning {
-            // The switch itself is already committed at this point — a relaunch
-            // failure must not read as a failed switch. Rethrow the dedicated
-            // error so the UI can say "switched, but Desktop didn't relaunch".
-            try await claudeApp.launchClaude()
+            do {
+                try await claudeApp.launchClaude()
+                return SwitchResult(switched: true, desktopRelaunched: true)
+            } catch {
+                return SwitchResult(
+                    switched: true,
+                    desktopRelaunched: false,
+                    relaunchError: error.localizedDescription)
+            }
         }
+        return SwitchResult(switched: true, desktopRelaunched: false)
     }
 
     // MARK: - Sign in / out
@@ -443,7 +497,7 @@ public final class ProfileManager {
             cliPath = url
         }
 
-        if store.activeProfileID != profile.id {
+        if method != .cli, store.activeProfileID != profile.id {
             try await switchTo(profile, relaunchDesktop: false)
         }
 
@@ -452,14 +506,16 @@ public final class ProfileManager {
             try await runDesktopSignIn(profile: profile, timeout: timeout, phase: phase)
         case .cli:
             phase?(.launchingCLI)
-            try await openTerminalForCLILogin(claudePath: cliPath!)
-        // CLI auth lives in the keychain; we can't reliably detect when the
-        // user has completed `/login`, so don't block here.
+            try await openTerminalForCLILogin(
+                claudePath: cliPath!, configDirectory: store.cliDirectory(profile))
+        // Terminal owns the interactive OAuth flow. The UI refreshes
+        // profile-scoped `claude auth status --json` after launch.
         case .both:
             try await runDesktopSignIn(profile: profile, timeout: timeout, phase: phase)
             phase?(.launchingCLI)
-            try await openTerminalForCLILogin(claudePath: cliPath!)
-        // Don't poll for CLI; see above.
+            try await openTerminalForCLILogin(
+                claudePath: cliPath!, configDirectory: store.cliDirectory(profile))
+        // Don't block the app while Terminal owns the interactive flow.
         }
 
         phase?(.done)
@@ -473,7 +529,7 @@ public final class ProfileManager {
     ) async throws {
         if claudeApp.isClaudeRunning {
             phase?(.quittingDesktop)
-            _ = await claudeApp.quitClaude()
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
         phase?(.launchingDesktop)
         try await claudeApp.launchClaude(activate: true)
@@ -506,7 +562,7 @@ public final class ProfileManager {
         let launchGrace = min(5, timeout / 4)
         while Date().timeIntervalSince(start) < timeout {
             if Task.isCancelled { return .cancelled }
-            let status = credentials.status(for: profile)
+            let status = credentials.status(for: profile, activeProfileID: store.activeProfileID)
             let s = surface == .cli ? status.cli : status.desktop
             if s.isSignedIn { return .found }
             if surface == .desktop,
@@ -538,11 +594,13 @@ public final class ProfileManager {
             store.activeProfileID == profile.id,
             claudeApp.isClaudeRunning
         {
-            _ = await claudeApp.quitClaude()
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
 
         if surfaces.contains(.desktop) {
-            if clearDesktopOAuthToken(in: store.desktopDirectory(profile)) == .unreadable {
+            if try clearDesktopOAuthToken(
+                in: layout.desktopDirectory(for: profile, activeProfileID: store.activeProfileID)) == .unreadable
+            {
                 throw ProfileError.migrationConflict(
                     "Couldn't sign out Desktop: this profile's config.json is unreadable. Delete it manually (or re-sign-in first), then retry."
                 )
@@ -550,9 +608,8 @@ public final class ProfileManager {
         }
 
         if surfaces.contains(.cli) {
-            for url in credentials.credentialFiles(for: profile, surface: .cli) {
-                try? FileManager.default.removeItem(at: url)
-            }
+            try await claudeCodeRunner.logout(configDirectory: store.cliDirectory(profile))
+            await credentials.invalidateCLIStatus(for: profile)
         }
 
         store.appendLog("signout: \(surfaces) for \(profile.name)")
@@ -568,15 +625,23 @@ public final class ProfileManager {
     /// directory. `.unreadable` means a config.json exists but can't be parsed
     /// or rewritten — callers must surface that instead of silently skipping.
     @discardableResult
-    private func clearDesktopOAuthToken(in desktopDir: URL) -> DesktopClearResult {
+    private func clearDesktopOAuthToken(in desktopDir: URL) throws -> DesktopClearResult {
         let configURL = desktopDir.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
-            clearDesktopCookies(in: desktopDir)
+            try clearDesktopCookies(in: desktopDir)
             return .nothingToClear
         }
-        guard let data = try? Data(contentsOf: configURL),
-            var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return .unreadable }
+        let data: Data
+        var json: [String: Any]
+        do {
+            data = try Data(contentsOf: configURL)
+            guard let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .unreadable
+            }
+            json = decoded
+        } catch {
+            return .unreadable
+        }
 
         let keysToClear = ["oauth:tokenCache"]
         var changed = false
@@ -585,25 +650,35 @@ public final class ProfileManager {
             changed = true
         }
         guard changed else {
-            clearDesktopCookies(in: desktopDir)
+            try clearDesktopCookies(in: desktopDir)
             return .nothingToClear
         }
 
-        guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
-            (try? out.write(to: configURL, options: .atomic)) != nil
-        else { return .unreadable }
+        do {
+            let out = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try out.write(to: configURL, options: .atomic)
+            let handle = try FileHandle(forWritingTo: configURL)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            return .unreadable
+        }
 
-        clearDesktopCookies(in: desktopDir)
+        try clearDesktopCookies(in: desktopDir)
         return .cleared
     }
 
     /// Reset the web session — the OAuth callback drops a cookie that would
     /// let Claude Desktop silently re-auth on next launch.
-    private func clearDesktopCookies(in desktopDir: URL) {
+    private func clearDesktopCookies(in desktopDir: URL) throws {
         let cookies = desktopDir.appendingPathComponent("Cookies")
-        try? FileManager.default.removeItem(at: cookies)
+        if FileManager.default.fileExists(atPath: cookies.path) {
+            try FileManager.default.removeItem(at: cookies)
+        }
         let cookiesJournal = desktopDir.appendingPathComponent("Cookies-journal")
-        try? FileManager.default.removeItem(at: cookiesJournal)
+        if FileManager.default.fileExists(atPath: cookiesJournal.path) {
+            try FileManager.default.removeItem(at: cookiesJournal)
+        }
     }
 
     // MARK: - Copy configuration between profiles
@@ -612,7 +687,7 @@ public final class ProfileManager {
     public func copyConfigAvailability(source: Profile) -> Set<CopyCategory> {
         configCopy.availableCategories(
             sourceCLI: store.cliDirectory(source),
-            sourceDesktop: store.desktopDirectory(source))
+            sourceDesktop: layout.desktopDirectory(for: source, activeProfileID: store.activeProfileID))
     }
 
     /// Read-only dry run. Deliberately does NOT quit Claude Desktop — planning
@@ -627,9 +702,9 @@ public final class ProfileManager {
         else { throw ProfileError.profileNotFound }
         return try configCopy.plan(
             sourceCLI: store.cliDirectory(source),
-            sourceDesktop: store.desktopDirectory(source),
+            sourceDesktop: layout.desktopDirectory(for: source, activeProfileID: store.activeProfileID),
             targetCLI: store.cliDirectory(target),
-            targetDesktop: store.desktopDirectory(target),
+            targetDesktop: layout.desktopDirectory(for: target, activeProfileID: store.activeProfileID),
             categories: categories, mode: mode)
     }
 
@@ -642,7 +717,7 @@ public final class ProfileManager {
         from source: Profile, to target: Profile
     ) async throws -> CopySummary {
         if plan.mutatesDesktop, store.activeProfileID == target.id, claudeApp.isClaudeRunning {
-            _ = await claudeApp.quitClaude()
+            guard await claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
         }
         // The service is Sendable and pure I/O — hop off the main actor.
         let service = configCopy
@@ -662,8 +737,8 @@ public final class ProfileManager {
     /// Using the absolute path (instead of relying on the Terminal session's
     /// PATH) makes "command not found" impossible. Failures — most notably the
     /// user denying the Automation permission — are thrown, not logged.
-    private func openTerminalForCLILogin(claudePath: URL) async throws {
-        let script = Self.cliLoginScript(claudePath: claudePath)
+    private func openTerminalForCLILogin(claudePath: URL, configDirectory: URL) async throws {
+        let script = Self.cliLoginScript(claudePath: claudePath, configDirectory: configDirectory)
         let result = await Self.runOSAScript(script)
         if let error = Self.mapOSAScriptFailure(status: result.status, stderr: result.stderr) {
             throw error
@@ -673,10 +748,17 @@ public final class ProfileManager {
     /// Pure helper (unit-tested): the AppleScript for the CLI login window.
     /// The path is single-quoted for the shell, then escaped for the
     /// AppleScript string literal.
-    static func cliLoginScript(claudePath: URL) -> String {
+    static func cliLoginScript(claudePath: URL, configDirectory: URL? = nil) -> String {
         let shellQuoted = "'" + claudePath.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let configPrefix: String
+        if let configDirectory {
+            let quoted = "'" + configDirectory.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            configPrefix = "env CLAUDE_CONFIG_DIR=\(quoted) "
+        } else {
+            configPrefix = ""
+        }
         let appleScriptEscaped =
-            shellQuoted
+            (configPrefix + shellQuoted + " auth login")
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         return """
@@ -685,6 +767,37 @@ public final class ProfileManager {
                 do script "\(appleScriptEscaped)"
             end tell
             """
+    }
+
+    /// Removes the unsafe legacy global keychain context. The migration UI
+    /// invokes this only after the user has closed legacy Claude Code sessions.
+    public func logoutLegacyGlobalCLI() async throws {
+        try preflightLegacyCLIProcesses()
+        try await claudeCodeRunner.logout(configDirectory: nil)
+        store.appendLog("migration-v2: logged out legacy global Claude Code context")
+    }
+
+    private func preflightLegacyCLIProcesses() throws {
+        // Test harnesses inject temporary canonical paths and must never inspect
+        // or affect the developer's real sessions.
+        guard cliCanonicalPath.standardizedFileURL == ProfileStore.claudeCLIPath.standardizedFileURL else {
+            return
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-U", "\(getuid())", "-x", "claude"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 { throw ProfileLayoutError.legacyCLIStillRunning }
+        } catch let error as ProfileLayoutError {
+            throw error
+        } catch {
+            throw ProfileError.migrationConflict(
+                "Could not verify whether legacy Claude Code sessions are running: \(error.localizedDescription)")
+        }
     }
 
     /// Pure helper (unit-tested): map an osascript failure to a SignInError.

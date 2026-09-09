@@ -18,9 +18,16 @@ public struct ProfilesWindow: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            layoutHealthBanner
+            Divider()
             list
             Divider()
             shellIntegrationSection
+            Divider()
+            syncStatusRow
+            if !vm.pendingRemoteDeletionProfiles.isEmpty {
+                pendingRemoteDeletionReview
+            }
             Divider()
             footer
         }
@@ -87,6 +94,44 @@ public struct ProfilesWindow: View {
         }
     }
 
+    private var syncStatusRow: some View {
+        HStack {
+            Label(vm.syncStatusText, systemImage: "icloud")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !vm.sync.pendingRemoteDeletions.isEmpty {
+                Text("\(vm.sync.pendingRemoteDeletions.count) remote deletion(s) require local review")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Spacer()
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+    }
+
+    private var pendingRemoteDeletionReview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(vm.pendingRemoteDeletionProfiles) { profile in
+                HStack {
+                    Text("“\(profile.name)” was deleted on another Mac.")
+                        .font(.caption)
+                    Spacer()
+                    Button("Keep on This Mac") { vm.keepPendingRemoteProfile(profile) }
+                    Button("Accept Deletion", role: .destructive) {
+                        vm.acceptPendingRemoteDeletion(profile)
+                    }
+                    .disabled(profile.id == vm.store.activeProfileID)
+                    .help(
+                        profile.id == vm.store.activeProfileID
+                            ? "Switch to another profile first." : "Move local profile data to the Trash.")
+                }
+            }
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 6)
+    }
+
     // MARK: - Header
 
     private var header: some View {
@@ -94,7 +139,7 @@ public struct ProfilesWindow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Claude Profiles").font(.title2).bold()
                 Text(
-                    "One profile per Claude account. Switching swaps the symlinks at ~/.claude and the Claude Desktop support folder."
+                    "One profile per Claude account. Desktop uses a Cowork-compatible real folder; new CLI sessions use the selected profile through CLAUDE_CONFIG_DIR."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -112,6 +157,7 @@ public struct ProfilesWindow: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
                 .keyboardShortcut("n", modifiers: [.command])
+                .disabled(!profileCreationAllowed)
 
                 if vm.store.activeProfile != nil {
                     Menu {
@@ -130,6 +176,50 @@ public struct ProfilesWindow: View {
             }
         }
         .padding()
+    }
+
+    @ViewBuilder
+    private var layoutHealthBanner: some View {
+        switch vm.layoutHealth {
+        case .healthy:
+            HStack {
+                Label("Profile storage healthy — Desktop uses a real folder", systemImage: "checkmark.shield.fill")
+                    .foregroundStyle(.green)
+                Spacer()
+                if vm.latestBackup != nil {
+                    if let message = vm.backupVerificationMessage {
+                        Text(message).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Menu("Backup") {
+                        Button("Verify Backup") { vm.verifyLatestBackup() }
+                        Button("Reveal in Finder") { vm.revealLatestBackup() }
+                        Button("Restore Backup…") { vm.requestRestoreLatestBackup() }
+                        Divider()
+                        Button("Move Backup to Trash…", role: .destructive) {
+                            vm.requestTrashLatestBackup()
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+        case .migrationRequired:
+            HStack {
+                Label(
+                    "Legacy layout detected. Migration and backup are required before switching.",
+                    systemImage: "externaldrive.badge.exclamationmark")
+                Spacer()
+                Button("Migrate…") { vm.showMigrationSheet = true }
+            }
+            .foregroundStyle(.orange)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+        case .recoveryRequired(let detail), .unsupportedFilesystem(let detail):
+            Label(detail, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+        }
     }
 
     // MARK: - List / empty state
@@ -191,6 +281,7 @@ public struct ProfilesWindow: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .keyboardShortcut(.defaultAction)
+            .disabled(!profileCreationAllowed)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -210,7 +301,7 @@ public struct ProfilesWindow: View {
             }
 
             Text(
-                "Bind a profile to a project so `claude` automatically uses the right account when you're inside that folder."
+                "Make ordinary `claude` commands use the selected profile. A project binding can override the default without changing running sessions."
             )
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -218,14 +309,15 @@ public struct ProfilesWindow: View {
 
             // How-it-works: tiny three-step explainer with example.
             VStack(alignment: .leading, spacing: 6) {
-                howStep(number: "1", text: "Install the integration below — adds a zsh function.")
+                howStep(number: "1", text: "Install the signed dispatcher for zsh, bash and fish.")
                 howStep(
                     number: "2",
-                    text: "Drop a `.claude-profile` file in any project with the profile name as the first line.")
+                    text:
+                        "Drop a `.claude-profile` file in any project with its profile UUID or name as the first line.")
                 howStep(
                     number: "3",
                     text:
-                        "Run `claude` from anywhere inside that project — uses the bound profile, isolated per-keychain."
+                        "Open a new shell and run `claude` — the dispatcher sets an isolated `CLAUDE_CONFIG_DIR`."
                 )
             }
             .padding(10)
@@ -257,6 +349,17 @@ public struct ProfilesWindow: View {
                 }
                 .buttonStyle(.bordered)
                 Spacer()
+            }
+
+            HStack(spacing: 12) {
+                ForEach(vm.cliIntegrationStatuses, id: \.shell) { status in
+                    Label(
+                        status.shell.rawValue,
+                        systemImage: status.installed ? "checkmark.circle.fill" : "xmark.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(status.installed ? Color.green : Color.secondary)
+                }
             }
 
             // Desktop hint — separate row with explanation under it. The
@@ -317,8 +420,12 @@ public struct ProfilesWindow: View {
                 .textFieldStyle(.roundedBorder)
                 .focused($newProfileFieldFocused)
                 .onSubmit { commitCreate() }
+                .disabled(!profileCreationAllowed)
             Button("Add") { commitCreate() }
-                .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(
+                    !profileCreationAllowed
+                        || newName.trimmingCharacters(in: .whitespaces).isEmpty
+                )
                 .buttonStyle(.bordered)
         }
         .padding()
@@ -327,10 +434,16 @@ public struct ProfilesWindow: View {
     // MARK: - Actions
 
     private func commitCreate() {
+        guard profileCreationAllowed else { return }
         let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         vm.createProfile(named: name)
         newName = ""
+    }
+
+    private var profileCreationAllowed: Bool {
+        if case .healthy = vm.layoutHealth { return true }
+        return false
     }
 
     private func commitRename(_ profile: Profile) {
@@ -416,6 +529,7 @@ private struct ProfileCardView: View {
 
     private var status: ProfileLoginStatus { vm.status(for: profile) }
     private var isActive: Bool { profile.id == vm.store.activeProfileID }
+    private var localState: LocalProfileState { vm.localState(for: profile) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -500,10 +614,17 @@ private struct ProfileCardView: View {
     }
 
     private var statusRow: some View {
-        HStack(spacing: 18) {
-            statusPill(label: "Desktop", surface: status.desktop)
-            statusPill(label: "CLI", surface: status.cli)
-            Spacer()
+        Group {
+            if localState == .setupRequired {
+                Label("Setup required on this Mac", systemImage: "externaldrive.badge.plus")
+                    .foregroundStyle(.orange)
+            } else {
+                HStack(spacing: 18) {
+                    statusPill(label: "Desktop", surface: status.desktop)
+                    statusPill(label: "CLI", surface: status.cli)
+                    Spacer()
+                }
+            }
         }
     }
 
@@ -531,123 +652,134 @@ private struct ProfileCardView: View {
     // profile. Sign-in / sign-out are secondary actions.
     private var actionRow: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                if !isActive {
-                    Button {
-                        vm.requestSwitch(to: profile)
-                    } label: {
-                        Label("Switch to this profile", systemImage: "arrow.left.arrow.right")
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 2)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .tint(profile.color)
-                    .disabled(vm.isSwitching)
-                } else {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(profile.color)
-                        Text("Currently active")
-                            .fontWeight(.medium)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 6)
-                }
-            }
-
-            HStack(spacing: 8) {
-                // Default sign-in method follows what's installed: both when
-                // both surfaces exist, otherwise the single available one.
-                let desktopAvailable = vm.surfaces.desktop != .notInstalled
-                let cliAvailable = vm.surfaces.cli != .notInstalled
-                let primaryMethod: ProfileManager.SignInMethod =
-                    desktopAvailable && cliAvailable ? .both : (desktopAvailable ? .desktop : .cli)
-
+            if localState == .setupRequired {
                 Button {
-                    vm.signIn(profile, method: primaryMethod)
+                    vm.setupLocalProfile(profile)
                 } label: {
-                    Label(
-                        status.bothSignedIn ? "Re-sign in" : "Sign in",
-                        systemImage: "checkmark.seal.fill")
+                    Label("Set up on this Mac", systemImage: "externaldrive.badge.plus")
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
-                .disabled(vm.isSwitching || (!desktopAvailable && !cliAvailable))
-
-                Menu {
-                    if desktopAvailable {
-                        Button("Sign in Desktop only") { vm.signIn(profile, method: .desktop) }
-                    }
-                    if cliAvailable {
-                        Button("Sign in CLI only") { vm.signIn(profile, method: .cli) }
-                    }
-                    Divider()
-                    if status.desktop.isSignedIn {
-                        Button("Sign out Desktop only", role: .destructive) {
-                            vm.signOut(profile, surfaces: [.desktop])
-                        }
-                    }
-                    if status.cli.isSignedIn {
-                        Button("Sign out CLI only", role: .destructive) {
-                            vm.signOut(profile, surfaces: [.cli])
-                        }
-                    }
-                } label: {
-                    Image(systemName: "chevron.down")
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 30)
+                .buttonStyle(.borderedProminent)
                 .disabled(vm.isSwitching)
+            } else {
+                HStack(spacing: 8) {
+                    if !isActive {
+                        Button {
+                            vm.requestSwitch(to: profile)
+                        } label: {
+                            Label("Switch to this profile", systemImage: "arrow.left.arrow.right")
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .tint(profile.color)
+                        .disabled(vm.isSwitching)
+                    } else {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(profile.color)
+                            Text("Currently active")
+                                .fontWeight(.medium)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                    }
+                }
 
-                Spacer()
+                HStack(spacing: 8) {
+                    // Default sign-in method follows what's installed: both when
+                    // both surfaces exist, otherwise the single available one.
+                    let desktopAvailable = vm.surfaces.desktop != .notInstalled
+                    let cliAvailable = vm.surfaces.cli != .notInstalled
+                    let primaryMethod: ProfileManager.SignInMethod =
+                        desktopAvailable && cliAvailable ? .both : (desktopAvailable ? .desktop : .cli)
 
-                if status.anySignedIn {
-                    Button(role: .destructive) {
-                        vm.signOut(profile)
+                    Button {
+                        vm.signIn(profile, method: primaryMethod)
                     } label: {
-                        Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                        Label(
+                            status.bothSignedIn ? "Re-sign in" : "Sign in",
+                            systemImage: "checkmark.seal.fill")
                     }
                     .buttonStyle(.bordered)
+                    .disabled(vm.isSwitching || (!desktopAvailable && !cliAvailable))
+
+                    Menu {
+                        if desktopAvailable {
+                            Button("Sign in Desktop only") { vm.signIn(profile, method: .desktop) }
+                        }
+                        if cliAvailable {
+                            Button("Sign in CLI only") { vm.signIn(profile, method: .cli) }
+                        }
+                        Divider()
+                        if status.desktop.isSignedIn {
+                            Button("Sign out Desktop only", role: .destructive) {
+                                vm.signOut(profile, surfaces: [.desktop])
+                            }
+                        }
+                        if status.cli.isSignedIn {
+                            Button("Sign out CLI only", role: .destructive) {
+                                vm.signOut(profile, surfaces: [.cli])
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .frame(width: 30)
                     .disabled(vm.isSwitching)
-                }
-            }
-            .controlSize(.regular)
 
-            if vm.signingInProfileID == profile.id, let text = vm.signInStatusText {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text(text).font(.caption).foregroundStyle(.secondary)
-                    if let started = vm.signInStartedAt {
-                        Text(started, style: .timer)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
-                    Spacer(minLength: 4)
-                    Button("Cancel") { vm.cancelSignIn() }
-                        .buttonStyle(.borderless)
-                        .controlSize(.small)
-                }
-            }
+                    Spacer()
 
-            if let failure = vm.signInFailure, failure.profileID == profile.id {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .font(.caption)
-                    Text(failure.message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
-                    Button("Retry") {
-                        vm.signInFailure = nil
-                        vm.signIn(profile, method: failure.method)
+                    if status.anySignedIn {
+                        Button(role: .destructive) {
+                            vm.signOut(profile)
+                        } label: {
+                            Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(vm.isSwitching)
                     }
-                    .controlSize(.small)
-                    Button("Dismiss") { vm.signInFailure = nil }
-                        .buttonStyle(.borderless)
+                }
+                .controlSize(.regular)
+
+                if vm.signingInProfileID == profile.id, let text = vm.signInStatusText {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(text).font(.caption).foregroundStyle(.secondary)
+                        if let started = vm.signInStartedAt {
+                            Text(started, style: .timer)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer(minLength: 4)
+                        Button("Cancel") { vm.cancelSignIn() }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
+                }
+
+                if let failure = vm.signInFailure, failure.profileID == profile.id {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
+                        Text(failure.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        Button("Retry") {
+                            vm.signInFailure = nil
+                            vm.signIn(profile, method: failure.method)
+                        }
                         .controlSize(.small)
+                        Button("Dismiss") { vm.signInFailure = nil }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                    }
                 }
             }
         }

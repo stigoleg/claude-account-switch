@@ -34,13 +34,19 @@ public struct SystemSurfaceLocator: SurfaceLocator {
     public static let shellTimeout: TimeInterval = 2.0
 
     public let cliCandidatePaths: [URL]
+    public let dispatcherPath: URL
     let shellLookup: @Sendable () async -> String?
 
     public init(
         cliCandidatePaths: [URL]? = nil,
+        dispatcherPath: URL? = nil,
         shellLookup: (@Sendable () async -> String?)? = nil
     ) {
         self.cliCandidatePaths = cliCandidatePaths ?? Self.defaultCandidatePaths()
+        self.dispatcherPath =
+            dispatcherPath
+            ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/claude-profile-switcher/bin/claude")
         self.shellLookup = shellLookup ?? { await Self.loginShellLookup() }
     }
 
@@ -52,23 +58,28 @@ public struct SystemSurfaceLocator: SurfaceLocator {
 
     public func cliExecutableURL() async -> URL? {
         let fm = FileManager.default
+        let dispatcher = dispatcherPath.resolvingSymlinksInPath().standardizedFileURL
         for candidate in cliCandidatePaths {
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: candidate.path, isDirectory: &isDir),
                 !isDir.boolValue,
-                fm.isExecutableFile(atPath: candidate.path)
+                fm.isExecutableFile(atPath: candidate.path),
+                candidate.resolvingSymlinksInPath().standardizedFileURL != dispatcher
             {
                 return candidate
             }
         }
         guard let path = await shellLookup(), !path.isEmpty else { return nil }
         let url = URL(fileURLWithPath: path)
-        return fm.isExecutableFile(atPath: url.path) ? url : nil
+        guard fm.isExecutableFile(atPath: url.path),
+            url.resolvingSymlinksInPath().standardizedFileURL != dispatcher
+        else { return nil }
+        return url
     }
 
     /// Well-known `claude` install locations, cheapest checks first.
-    /// `~/.claude/local/claude` resolves through the per-profile symlink, so
-    /// callers should re-refresh availability after a profile switch.
+    /// Includes legacy and current installer locations. ProfileManager adds
+    /// stable profile-local candidates while migrating v1 installations.
     static func defaultCandidatePaths() -> [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return [

@@ -2,7 +2,6 @@ import SwiftUI
 
 public struct FirstRunMigrationView: View {
     @Bindable var vm: AppViewModel
-    @Environment(\.dismiss) private var dismiss
 
     public init(vm: AppViewModel) {
         self._vm = Bindable(wrappedValue: vm)
@@ -13,12 +12,12 @@ public struct FirstRunMigrationView: View {
             Text("Set up Claude Profile Switcher").font(.title2).bold()
 
             Text(
-                "Your existing Claude data will be moved into a profile named **\"default\"**, and the canonical paths will be replaced with symlinks pointing at it. Nothing is deleted."
+                "Your existing profiles will be protected by an APFS copy-on-write backup. Claude Desktop will then use a real folder so Cowork can mount it safely. Nothing is deleted."
             )
 
             VStack(alignment: .leading, spacing: 4) {
-                Label("~/.claude → moved into profile", systemImage: "terminal")
-                Label("~/Library/Application Support/Claude → moved into profile", systemImage: "app.badge")
+                Label("Existing CLI profile folders stay byte-for-byte intact", systemImage: "terminal")
+                Label("Claude Desktop symlink → real active profile folder", systemImage: "app.badge")
             }
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -28,14 +27,23 @@ public struct FirstRunMigrationView: View {
                 .font(.callout)
                 .foregroundStyle(.orange)
 
+            if vm.isSwitching {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Creating and verifying the pre-v2 backup…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             HStack {
                 Spacer()
-                Button("Later") { dismiss() }
+                Button("Later") { vm.showMigrationSheet = false }
                 Button("Run Migration") {
                     vm.performMigration()
-                    dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
+                .disabled(vm.isSwitching)
             }
         }
         .padding(20)

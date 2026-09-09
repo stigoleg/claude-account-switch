@@ -21,6 +21,7 @@ public struct CopyConfigSheet: View {
     @State private var resolutions: [CopyItem.ID: ConflictResolution] = [:]
     @State private var isWorking = false
     @State private var errorMessage: String?
+    @State private var secretWarningAccepted = false
 
     public init(vm: AppViewModel, target: Profile, onDone: @escaping () -> Void) {
         self._vm = Bindable(wrappedValue: vm)
@@ -54,8 +55,10 @@ public struct CopyConfigSheet: View {
     @ViewBuilder
     private var configureStep: some View {
         Text("Copy configuration into “\(target.name)”").font(.title2).bold()
-        Text("Pick the profile to copy from and what to bring over. Sign-in state and credentials are never copied.")
-            .foregroundStyle(.secondary)
+        Text(
+            "Pick the profile to copy from and what to bring over. Claude login state is never copied; settings and MCP entries can contain their own API keys."
+        )
+        .foregroundStyle(.secondary)
 
         Picker("From profile", selection: $source) {
             Text("Choose…").tag(Profile?.none)
@@ -130,6 +133,7 @@ public struct CopyConfigSheet: View {
             // FROM that profile because it's the configured one.
             resolutions = Dictionary(
                 uniqueKeysWithValues: plan.allConflicts.map { ($0.id, ConflictResolution.useSource) })
+            secretWarningAccepted = false
             step = .review(plan)
         } catch {
             errorMessage = error.localizedDescription
@@ -193,6 +197,19 @@ public struct CopyConfigSheet: View {
             .foregroundStyle(.orange)
         }
 
+        if plan.containsPotentialSecrets {
+            VStack(alignment: .leading, spacing: 6) {
+                Label(
+                    "The selected settings contain fields such as env, headers, token, key, secret, or password. Their values will be copied but never shown here or written to logs.",
+                    systemImage: "key.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                Toggle("I understand that embedded secrets may be copied", isOn: $secretWarningAccepted)
+                    .font(.caption)
+            }
+        }
+
         if let errorMessage {
             errorRow(errorMessage)
         }
@@ -206,7 +223,9 @@ public struct CopyConfigSheet: View {
             Button("Cancel") { onDone() }
             Button("Copy") { runExecute(plan) }
                 .buttonStyle(.borderedProminent)
-                .disabled(vm.isSwitching || isWorking || plan.isEmpty)
+                .disabled(
+                    vm.isSwitching || isWorking || plan.isEmpty
+                        || (plan.containsPotentialSecrets && !secretWarningAccepted))
         }
     }
 

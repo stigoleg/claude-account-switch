@@ -15,8 +15,13 @@ swift build -c "$CONFIG"
 
 BIN_PATH="$(swift build -c "$CONFIG" --show-bin-path)"
 BIN="$BIN_PATH/$APP_NAME"
+DISPATCHER_BIN="$BIN_PATH/ClaudeProfileDispatcher"
 if [[ ! -x "$BIN" ]]; then
     echo "error: built binary not found at $BIN" >&2
+    exit 1
+fi
+if [[ ! -x "$DISPATCHER_BIN" ]]; then
+    echo "error: built dispatcher not found at $DISPATCHER_BIN" >&2
     exit 1
 fi
 
@@ -27,8 +32,10 @@ echo "==> assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/Helpers"
 
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
+cp "$DISPATCHER_BIN" "$APP/Contents/Helpers/ClaudeProfileDispatcher"
 cp AppBundle/Info.plist "$APP/Contents/Info.plist"
 
 # Stamp the version before signing — codesign seals Info.plist into the
@@ -52,17 +59,39 @@ if [[ -d "$BUNDLE" ]]; then
     cp -R "$BUNDLE" "$APP/Contents/Resources/"
 fi
 
-# Default is ad-hoc ("-"). Set CODESIGN_IDENTITY to a Developer ID
-# Application identity to produce a distributable signature; a notarization
-# step can then be added after packaging without restructuring this script.
+# Default is ad-hoc ("-"). Apple Development identities produce a local-only
+# account-signed build. Developer ID Application identities enable the release
+# entitlements and are suitable for notarized distribution.
 SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
     echo "==> ad-hoc code-signing"
+    ENTITLEMENTS="AppBundle/ClaudeProfileSwitcher.local.entitlements"
+    SIGN_OPTIONS=(--options runtime)
+elif [[ "$SIGN_IDENTITY" == Apple\ Development:* ]]; then
+    echo "==> local Apple Development signing as: $SIGN_IDENTITY"
+    ENTITLEMENTS="AppBundle/ClaudeProfileSwitcher.local.entitlements"
+    SIGN_OPTIONS=(--options runtime)
 else
-    echo "==> code-signing as: $SIGN_IDENTITY"
+    if [[ "$SIGN_IDENTITY" != Developer\ ID\ Application:* ]]; then
+        echo "error: release identity must begin with 'Developer ID Application:'" >&2
+        exit 1
+    fi
+    echo "==> Developer ID signing as: $SIGN_IDENTITY"
+    : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required for Developer ID signing}"
+    ENTITLEMENTS="$OUT_DIR/ClaudeProfileSwitcher.release.entitlements"
+    cp AppBundle/ClaudeProfileSwitcher.entitlements "$ENTITLEMENTS"
+    /usr/libexec/PlistBuddy -c \
+        "Set :com.apple.developer.ubiquity-kvstore-identifier ${APPLE_TEAM_ID}.com.stigole.ClaudeProfileSwitcher" \
+        "$ENTITLEMENTS"
+    SIGN_OPTIONS=(--options runtime --timestamp)
+    if [[ -n "${DEVELOPER_ID_PROVISIONING_PROFILE:-}" ]]; then
+        cp "$DEVELOPER_ID_PROVISIONING_PROFILE" "$APP/Contents/embedded.provisionprofile"
+    fi
 fi
-codesign --force --deep --sign "$SIGN_IDENTITY" \
-    --entitlements AppBundle/ClaudeProfileSwitcher.entitlements \
+codesign --force --sign "$SIGN_IDENTITY" "${SIGN_OPTIONS[@]}" \
+    "$APP/Contents/Helpers/ClaudeProfileDispatcher"
+codesign --force --sign "$SIGN_IDENTITY" "${SIGN_OPTIONS[@]}" \
+    --entitlements "$ENTITLEMENTS" \
     "$APP"
 
 echo

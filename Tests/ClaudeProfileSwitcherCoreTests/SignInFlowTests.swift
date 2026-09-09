@@ -33,11 +33,15 @@ final class SignInFlowTests: XCTestCase {
             cliCanonicalPath: cliCanonical,
             desktopCanonicalPath: desktopCanonical
         )
+        try fm.createDirectory(at: cliCanonical, withIntermediateDirectories: true)
+        try fm.createDirectory(at: desktopCanonical, withIntermediateDirectories: true)
+        try manager.runFirstRunMigration()
         return Harness(manager: manager, store: store, claudeApp: claudeApp, cleanup: cleanup)
     }
 
-    private func writeDesktopToken(for profile: Profile, in store: ProfileStore) throws {
-        let dir = store.desktopDirectory(profile)
+    private func writeDesktopToken(for profile: Profile, in harness: Harness) throws {
+        let dir = harness.manager.layout.desktopDirectory(
+            for: profile, activeProfileID: harness.store.activeProfileID)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let config = dir.appendingPathComponent("config.json")
         try #"{"oauth:tokenCache":"tok"}"#.write(to: config, atomically: true, encoding: .utf8)
@@ -94,12 +98,11 @@ final class SignInFlowTests: XCTestCase {
         let profile = try h.manager.createProfile(name: "p")
 
         let phases = PhaseLog()
-        let store = h.store
 
         // Drop the token shortly after the wait starts.
         let writer = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 400_000_000)
-            try? self.writeDesktopToken(for: profile, in: store)
+            try? self.writeDesktopToken(for: profile, in: h)
         }
         defer { writer.cancel() }
 
@@ -175,12 +178,15 @@ final class SignInFlowTests: XCTestCase {
 
     func testCLILoginScriptQuotesPath() {
         let script = ProfileManager.cliLoginScript(
-            claudePath: URL(fileURLWithPath: "/Users/o'brien/my bin/claude"))
+            claudePath: URL(fileURLWithPath: "/Users/o'brien/my bin/claude"),
+            configDirectory: URL(fileURLWithPath: "/Users/o'brien/Profiles/Work Account"))
         // Shell-quoted inside an AppleScript string literal.
         XCTAssertTrue(
-            script.contains(#"do script "'/Users/o'\\''brien/my bin/claude'""#),
+            script.contains(#"'/Users/o'\\''brien/my bin/claude' auth login"#),
             "unexpected script: \(script)")
         XCTAssertTrue(script.contains("tell application \"Terminal\""))
+        XCTAssertTrue(script.contains("CLAUDE_CONFIG_DIR="))
+        XCTAssertTrue(script.contains("Work Account"))
     }
 
     func testMapOSAScriptFailure() {

@@ -1,12 +1,13 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 // MARK: - Model types
 
-/// What can be copied between profiles. Strict allow-list: every category maps
-/// to a fixed set of known-safe paths — credential files (`config.json` with
-/// `oauth:tokenCache`, `.credentials.json`, Cookies, browser storage…) are
-/// never enumerated, so copying them is structurally impossible.
+/// What can be copied between profiles. Every category maps to a strict path
+/// allow-list. Claude auth stores, cookies and browser storage are structurally
+/// excluded; settings and MCP files can still contain user-supplied API keys,
+/// so plans scan their key names and require an explicit warning in the UI.
 public enum CopyCategory: String, CaseIterable, Codable, Sendable, Identifiable {
     case cliMCPServers
     case cliPlugins
@@ -111,6 +112,9 @@ public struct CopyPlan: Sendable {
     public let targetDesktop: URL
     public let mode: CopyMode
     public let categories: [CategoryPlan]
+    public let sourceFingerprint: String
+    public let targetFingerprint: String
+    public let containsPotentialSecrets: Bool
 
     public var allConflicts: [CopyConflict] { categories.flatMap(\.conflicts) }
     public var isEmpty: Bool {
@@ -137,6 +141,8 @@ public enum ConfigCopyError: LocalizedError {
     case unreadableJSON(URL)
     case ioFailure(String)
     case partialFailure(completed: CopySummary, failedItem: CopyItem, underlying: Error)
+    case stalePlan
+    case rollbackFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -148,8 +154,13 @@ public enum ConfigCopyError: LocalizedError {
             return message
         case .partialFailure(let completed, let failedItem, let underlying):
             return "Copy stopped at \"\(failedItem.displayName)\": \(underlying.localizedDescription). "
-                + "\(completed.copied.count) item(s) were copied before the failure; "
-                + "anything replaced is in the Trash. Re-running the copy is safe."
+                + "\(completed.copied.count) item(s) were attempted before the failure; "
+                + "the target was restored from the durable rollback bundle."
+        case .stalePlan:
+            return
+                "The source or target configuration changed after preview. Review a fresh copy plan before continuing."
+        case .rollbackFailed(let message):
+            return "Copy failed and automatic rollback also failed: \(message)"
         }
     }
 }
@@ -169,14 +180,20 @@ public struct ConfigCopyService: @unchecked Sendable {
     /// Trash seam — production moves to the macOS Trash (recoverable); tests
     /// capture the URLs instead.
     public let trash: @Sendable (URL) throws -> Void
+    public let recoveryDirectory: URL
 
     public init(
         fm: FileManager = .default,
+        recoveryDirectory: URL? = nil,
         trash: @escaping @Sendable (URL) throws -> Void = { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         }
     ) {
         self.fm = fm
+        self.recoveryDirectory =
+            recoveryDirectory
+            ?? fm.temporaryDirectory.appendingPathComponent(
+                "ClaudeProfileSwitcher-CopyRecovery", isDirectory: true)
         self.trash = trash
     }
 
@@ -248,7 +265,14 @@ public struct ConfigCopyService: @unchecked Sendable {
         return CopyPlan(
             sourceCLI: sourceCLI, sourceDesktop: sourceDesktop,
             targetCLI: targetCLI, targetDesktop: targetDesktop,
-            mode: mode, categories: plans)
+            mode: mode,
+            categories: plans,
+            sourceFingerprint: configurationFingerprint(
+                cliRoot: sourceCLI, desktopRoot: sourceDesktop, categories: categories),
+            targetFingerprint: configurationFingerprint(
+                cliRoot: targetCLI, desktopRoot: targetDesktop, categories: categories),
+            containsPotentialSecrets: containsPotentialSecrets(
+                cliRoot: sourceCLI, desktopRoot: sourceDesktop, categories: categories))
     }
 
     private func planCategory(
@@ -502,6 +526,54 @@ public struct ConfigCopyService: @unchecked Sendable {
         _ plan: CopyPlan,
         resolutions: [CopyItem.ID: ConflictResolution] = [:]
     ) throws -> CopySummary {
+        try recoverPendingCopy()
+        let selectedCategories = Set(plan.categories.map(\.category))
+        guard
+            configurationFingerprint(
+                cliRoot: plan.sourceCLI,
+                desktopRoot: plan.sourceDesktop,
+                categories: selectedCategories) == plan.sourceFingerprint,
+            configurationFingerprint(
+                cliRoot: plan.targetCLI,
+                desktopRoot: plan.targetDesktop,
+                categories: selectedCategories) == plan.targetFingerprint
+        else { throw ConfigCopyError.stalePlan }
+
+        let rollback = try makeRollbackSnapshot(for: plan)
+        do {
+            let summary = try executeUnchecked(plan, resolutions: resolutions)
+            try finishRollbackSnapshot(rollback)
+            return summary
+        } catch {
+            do {
+                try restore(rollback)
+            } catch let rollbackError {
+                throw ConfigCopyError.rollbackFailed(
+                    "\(error.localizedDescription); rollback: \(rollbackError.localizedDescription)")
+            }
+            throw error
+        }
+    }
+
+    /// If the process died after the durable rollback journal was written,
+    /// restore every target before allowing another copy operation.
+    public func recoverPendingCopy() throws {
+        guard itemExists(rollbackJournalURL) else { return }
+        let snapshot: RollbackSnapshot
+        do {
+            snapshot = try JSONDecoder().decode(
+                RollbackSnapshot.self, from: Data(contentsOf: rollbackJournalURL))
+        } catch {
+            throw ConfigCopyError.rollbackFailed(
+                "the recovery journal is unreadable: \(error.localizedDescription)")
+        }
+        try restore(snapshot)
+    }
+
+    private func executeUnchecked(
+        _ plan: CopyPlan,
+        resolutions: [CopyItem.ID: ConflictResolution]
+    ) throws -> CopySummary {
         var summary = CopySummary()
 
         for categoryPlan in plan.categories {
@@ -616,6 +688,111 @@ public struct ConfigCopyService: @unchecked Sendable {
         return summary
     }
 
+    private struct RollbackEntry: Codable {
+        let target: URL
+        let backup: URL?
+    }
+
+    private struct RollbackSnapshot: Codable {
+        let root: URL
+        let entries: [RollbackEntry]
+    }
+
+    private var rollbackJournalURL: URL {
+        recoveryDirectory.appendingPathComponent("pending.json")
+    }
+
+    private func makeRollbackSnapshot(for plan: CopyPlan) throws -> RollbackSnapshot {
+        guard !itemExists(rollbackJournalURL) else {
+            throw ConfigCopyError.rollbackFailed("another copy operation requires recovery")
+        }
+        try fm.createDirectory(
+            at: recoveryDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let root = recoveryDirectory.appendingPathComponent("transaction-\(UUID().uuidString)")
+        try fm.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        var targets: Set<URL> = []
+        for category in plan.categories {
+            let targetRoot = category.category.isDesktop ? plan.targetDesktop : plan.targetCLI
+            let items = category.additions + category.conflicts.map(\.item) + category.replacements
+            for item in items {
+                switch item.kind {
+                case .jsonEntry(let file, _, _), .jsonRemainder(let file, _):
+                    targets.insert(targetRoot.appendingPathComponent(file))
+                case .path(let relative):
+                    targets.insert(targetRoot.appendingPathComponent(relative))
+                case .composite(let relatives):
+                    for relative in relatives { targets.insert(targetRoot.appendingPathComponent(relative)) }
+                }
+            }
+        }
+        var entries: [RollbackEntry] = []
+        for (index, target) in targets.sorted(by: { $0.path < $1.path }).enumerated() {
+            if itemExists(target) {
+                let backup = root.appendingPathComponent("\(index)")
+                try fm.copyItem(at: target, to: backup)
+                entries.append(RollbackEntry(target: target, backup: backup))
+            } else {
+                entries.append(RollbackEntry(target: target, backup: nil))
+            }
+        }
+        let snapshot = RollbackSnapshot(root: root, entries: entries)
+        try atomicJournalWrite(try JSONEncoder().encode(snapshot), to: rollbackJournalURL)
+        return snapshot
+    }
+
+    private func restore(_ snapshot: RollbackSnapshot) throws {
+        var firstError: Error?
+        for entry in snapshot.entries {
+            do {
+                if itemExists(entry.target) { try fm.removeItem(at: entry.target) }
+                if let backup = entry.backup {
+                    try fm.createDirectory(
+                        at: entry.target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fm.copyItem(at: backup, to: entry.target)
+                }
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+        try finishRollbackSnapshot(snapshot)
+    }
+
+    private func finishRollbackSnapshot(_ snapshot: RollbackSnapshot) throws {
+        if itemExists(rollbackJournalURL) {
+            try fm.removeItem(at: rollbackJournalURL)
+            try synchronizeDirectory(recoveryDirectory)
+        }
+        if itemExists(snapshot.root) { try fm.removeItem(at: snapshot.root) }
+    }
+
+    private func atomicJournalWrite(_ data: Data, to url: URL) throws {
+        let temporary = recoveryDirectory.appendingPathComponent(".pending-\(UUID().uuidString).json")
+        try data.write(to: temporary, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        let handle = try FileHandle(forWritingTo: temporary)
+        try handle.synchronize()
+        try handle.close()
+        try fm.moveItem(at: temporary, to: url)
+        try synchronizeDirectory(recoveryDirectory)
+    }
+
+    private func synchronizeDirectory(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw ConfigCopyError.ioFailure("Could not synchronize Copy Config recovery metadata.")
+        }
+        defer { close(descriptor) }
+        guard fsync(descriptor) == 0 else {
+            throw ConfigCopyError.ioFailure("Could not synchronize Copy Config recovery metadata.")
+        }
+    }
+
     /// Apply all chosen JSON entries (and remainder) of a category in a single
     /// read-modify-write per file, preserving every unrelated top-level key —
     /// in particular `.claude.json`'s identity fields (oauthAccount, userID,
@@ -724,6 +901,80 @@ public struct ConfigCopyService: @unchecked Sendable {
 
     // MARK: - Comparison helpers
 
+    private func configurationFingerprint(
+        cliRoot: URL,
+        desktopRoot: URL,
+        categories: Set<CopyCategory>
+    ) -> String {
+        var hasher = SHA256()
+        for category in CopyCategory.allCases where categories.contains(category) {
+            let root = category.isDesktop ? desktopRoot : cliRoot
+            let paths: [String]
+            switch category {
+            case .cliMCPServers: paths = [Self.claudeJSONFile]
+            case .cliPlugins: paths = Self.pluginPaths
+            case .cliSkillsAndCommands: paths = Self.skillsParents + [Self.claudeMDFile]
+            case .cliSettings: paths = [Self.cliSettingsFile]
+            case .desktopMCPAndConfig: paths = [Self.desktopConfigFile]
+            case .desktopExtensions: paths = Self.desktopExtensionPaths
+            }
+            hasher.update(data: Data(category.rawValue.utf8))
+            for relative in paths.sorted() {
+                let url = root.appendingPathComponent(relative)
+                hasher.update(data: Data(relative.utf8))
+                if let hash = pathHash(url) {
+                    hasher.update(data: Data(hash.utf8))
+                } else {
+                    hasher.update(data: Data("missing".utf8))
+                }
+            }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func containsPotentialSecrets(
+        cliRoot: URL,
+        desktopRoot: URL,
+        categories: Set<CopyCategory>
+    ) -> Bool {
+        var files: [URL] = []
+        if categories.contains(.cliMCPServers) {
+            files.append(cliRoot.appendingPathComponent(Self.claudeJSONFile))
+        }
+        if categories.contains(.cliSettings) {
+            files.append(cliRoot.appendingPathComponent(Self.cliSettingsFile))
+        }
+        if categories.contains(.desktopMCPAndConfig) {
+            files.append(desktopRoot.appendingPathComponent(Self.desktopConfigFile))
+        }
+        for file in files {
+            guard let data = try? Data(contentsOf: file),
+                let json = try? JSONSerialization.jsonObject(with: data)
+            else { continue }
+            if jsonContainsPotentialSecret(json) { return true }
+        }
+        return false
+    }
+
+    private func jsonContainsPotentialSecret(_ value: Any) -> Bool {
+        if let dictionary = value as? [String: Any] {
+            for (key, nested) in dictionary {
+                let normalized = key.lowercased()
+                if normalized == "env" || normalized.contains("token")
+                    || normalized.contains("password") || normalized.contains("secret")
+                    || normalized.contains("header") || normalized.hasSuffix("apikey")
+                    || normalized.hasSuffix("api_key")
+                {
+                    return true
+                }
+                if jsonContainsPotentialSecret(nested) { return true }
+            }
+        } else if let array = value as? [Any] {
+            return array.contains(where: jsonContainsPotentialSecret)
+        }
+        return false
+    }
+
     /// Exists without following symlinks (same semantics as SymlinkService).
     func itemExists(_ url: URL) -> Bool {
         if fm.fileExists(atPath: url.path) { return true }
@@ -796,7 +1047,7 @@ public struct ConfigCopyService: @unchecked Sendable {
         case .typeDirectory:
             hasher.update(data: Data("dir".utf8))
             let names = ((try? fm.contentsOfDirectory(atPath: url.path)) ?? []).sorted()
-            for name in names where !name.hasPrefix(".") {
+            for name in names {
                 if !hashInto(
                     &hasher, url: url.appendingPathComponent(name),
                     relative: relative.isEmpty ? name : "\(relative)/\(name)")

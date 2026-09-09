@@ -14,19 +14,30 @@ public struct Profile: Identifiable, Hashable, Codable, Sendable {
     /// per-profile conflicts (last-writer-wins). Decoded as `.distantPast` when
     /// missing from older on-disk JSON.
     public var updatedAt: Date
+    /// Previous display names accepted by the CLI dispatcher. Project binding
+    /// files should prefer the UUID, but aliases keep existing name-based files
+    /// working after a rename.
+    public var aliases: [String]
+    /// Deterministic cross-device revision. Newer counters win; deviceID is a
+    /// stable tie-breaker for concurrent edits with the same counter.
+    public var revision: ProfileRevision
 
     public init(
         id: UUID = UUID(),
         name: String,
         colorHex: String = Profile.defaultColors.randomElement()!,
         createdAt: Date = .now,
-        updatedAt: Date = .now
+        updatedAt: Date = .now,
+        aliases: [String] = [],
+        revision: ProfileRevision = .legacy
     ) {
         self.id = id
         self.name = name
         self.colorHex = colorHex
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.aliases = aliases
+        self.revision = revision
     }
 
     public init(from decoder: Decoder) throws {
@@ -36,6 +47,8 @@ public struct Profile: Identifiable, Hashable, Codable, Sendable {
         self.colorHex = try c.decode(String.self, forKey: .colorHex)
         self.createdAt = try c.decode(Date.self, forKey: .createdAt)
         self.updatedAt = try c.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .distantPast
+        self.aliases = try c.decodeIfPresent([String].self, forKey: .aliases) ?? []
+        self.revision = try c.decodeIfPresent(ProfileRevision.self, forKey: .revision) ?? .legacy
     }
 
     public var color: Color { Color(hex: colorHex) ?? .accentColor }
@@ -48,6 +61,23 @@ public struct Profile: Identifiable, Hashable, Codable, Sendable {
         "#F2C14E",  // amber
         "#E16B6B",  // red
     ]
+}
+
+public struct ProfileRevision: Codable, Hashable, Sendable, Comparable {
+    public let counter: UInt64
+    public let deviceID: String
+
+    public init(counter: UInt64, deviceID: String) {
+        self.counter = counter
+        self.deviceID = deviceID
+    }
+
+    public static let legacy = ProfileRevision(counter: 0, deviceID: "legacy")
+
+    public static func < (lhs: ProfileRevision, rhs: ProfileRevision) -> Bool {
+        if lhs.counter != rhs.counter { return lhs.counter < rhs.counter }
+        return lhs.deviceID < rhs.deviceID
+    }
 }
 
 extension Color {

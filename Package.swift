@@ -5,7 +5,8 @@ let package = Package(
     name: "ClaudeProfileSwitcher",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "ClaudeProfileSwitcher", targets: ["ClaudeProfileSwitcher"])
+        .executable(name: "ClaudeProfileSwitcher", targets: ["ClaudeProfileSwitcher"]),
+        .executable(name: "ClaudeProfileDispatcher", targets: ["ClaudeProfileDispatcher"]),
     ],
     targets: [
         .executableTarget(
@@ -19,6 +20,14 @@ let package = Package(
         .target(
             name: "ClaudeProfileSwitcherCore",
             path: "Sources/ClaudeProfileSwitcherCore",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "ClaudeProfileDispatcher",
+            dependencies: ["ClaudeProfileSwitcherCore"],
+            path: "Sources/ClaudeProfileDispatcher",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

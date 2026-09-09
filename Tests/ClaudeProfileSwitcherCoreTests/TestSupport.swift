@@ -11,6 +11,7 @@ enum TestSupport {
     static func makeTempDirectory(file: StaticString = #file, line: UInt = #line) throws -> (URL, () -> Void) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("cps-tests-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         let cleanup: () -> Void = {
             try? FileManager.default.removeItem(at: url)
@@ -20,7 +21,7 @@ enum TestSupport {
 
     /// Resolve a fixture file from the Tests/.../Fixtures directory copied into
     /// the test bundle's Resources.
-    static func fixtureURL(_ name: String, file: StaticString = #file, line: UInt = #line) throws -> URL {
+    static func fixtureURL(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws -> URL {
         guard let url = Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Fixtures") else {
             XCTFail("Fixture \(name) not found in test bundle", file: file, line: line)
             throw NSError(
@@ -46,13 +47,14 @@ final class FakeClaudeAppController: ClaudeAppControlling {
     var isClaudeRunning = false
     var installed = true
     var launchShouldFail = false
+    var quitSucceeds = true
     private(set) var quitCalls = 0
     private(set) var launchCalls = 0
 
     func quitClaude(timeout: TimeInterval) async -> Bool {
         quitCalls += 1
-        isClaudeRunning = false
-        return true
+        if quitSucceeds { isClaudeRunning = false }
+        return quitSucceeds
     }
 
     func locateClaudeBundleURL() -> URL? {

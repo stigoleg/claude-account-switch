@@ -8,3 +8,22 @@ build/
 DerivedData/
 dist/
 .claude/
+
+# Local Apple signing material. Never commit certificates, requests, private
+# keys, provisioning profiles, notarization keys, or signing environment files.
+.signing-private/
+*.certSigningRequest
+*.p12
+*.p8
+*.cer
+*.provisionprofile
+*.mobileprovision
+.env.signing
+
+# Local AI-agent instructions and recipes are workstation-specific and must
+# not be published with the open-source project.
+AGENTS.md
+CLAUDE.md
+SKILL.md
+.codex/
+.agents/

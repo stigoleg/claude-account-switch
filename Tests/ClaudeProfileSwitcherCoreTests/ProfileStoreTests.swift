@@ -96,4 +96,23 @@ final class ProfileStoreTests: XCTestCase {
         store.upsert(Profile(name: "personal"))
         XCTAssertEqual(calls, 2)
     }
+
+    func testCorruptPrimaryLoadsPreviousSnapshotReadOnlyWithoutOverwrite() throws {
+        let (tmp, cleanup) = try TestSupport.makeTempDirectory()
+        defer { cleanup() }
+        let store = ProfileStore(supportRoot: tmp)
+        store.load()
+        try store.upsertThrowing(Profile(name: "first"))
+        try store.upsertThrowing(Profile(name: "second"))
+        try "not-json".write(to: store.profilesFileURL, atomically: true, encoding: .utf8)
+
+        let recovered = ProfileStore(supportRoot: tmp)
+        recovered.load()
+        XCTAssertTrue(recovered.requiresMetadataRecovery)
+        XCTAssertEqual(recovered.profiles.map(\.name), ["first"])
+        XCTAssertThrowsError(try recovered.upsertThrowing(Profile(name: "must-not-write")))
+        XCTAssertEqual(
+            try String(contentsOf: recovered.profilesFileURL, encoding: .utf8),
+            "not-json")
+    }
 }

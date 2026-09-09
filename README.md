@@ -17,20 +17,20 @@ When you sign in with a second account, it overwrites the first. So you end up s
 
 ## How it works
 
-Every account gets a private copy of both directories, kept together in one place:
+Every account gets isolated Desktop and CLI data, kept together in one place:
 
 ```
 ~/Library/Application Support/ClaudeProfileSwitcher/
 └── profiles/
     ├── <personal>/
-    │   ├── cli/        ← ~/.claude points here
-    │   └── desktop/    ← ~/Library/Application Support/Claude points here
+    │   ├── cli/        ← selected with CLAUDE_CONFIG_DIR
+    │   └── desktop/    ← stored here while this profile is inactive
     └── <work>/
         ├── cli/
         └── desktop/
 ```
 
-The real paths become symlinks that point at whichever profile is active. A switch simply repoints them. The operation is atomic, takes no time, and is invisible to Claude. If Claude Desktop is running, the app asks for confirmation first, quits it cleanly, flips the links, and starts it again on the other account. Any terminal you open afterwards picks up the right account on its own.
+The active Desktop profile always lives at the real `~/Library/Application Support/Claude` directory, so Cowork can mount paths beneath it without crossing a symlink. Switching uses a journaled atomic APFS directory swap. Claude Code runs through a compiled dispatcher that sets a profile-specific `CLAUDE_CONFIG_DIR`; existing CLI sessions keep their account and new sessions use the selected profile.
 
 ## Install
 
@@ -41,23 +41,17 @@ brew tap stigoleg/tap
 brew install --cask claude-profile-switcher
 ```
 
-Newer Homebrew versions warn that taps outside Homebrew's own are untrusted. The install still works, and you can silence the warning for this cask with a one time:
+Newer Homebrew versions warn that taps outside Homebrew's own are untrusted. The install still works, and you can trust this cask with:
 
 ```bash
 brew trust --cask stigoleg/tap/claude-profile-switcher
 ```
 
-There is one extra step before the first launch. The app is ad hoc signed (no paid Apple Developer ID), so macOS quarantines the download and Gatekeeper refuses to open it. Either right click the app in Finder and choose Open, which you only need to do once, or clear the quarantine flag:
-
-```bash
-xattr -d com.apple.quarantine "/Applications/Claude Profile Switcher.app"
-```
-
-Only do this for software you trust. You can check every download against the `SHA256SUMS` file attached to its [GitHub release](https://github.com/stigoleg/claude-account-switch/releases).
+Version 2 releases are Developer ID signed, hardened and notarized. Release assets include SHA-256 checksums and an SPDX software bill of materials.
 
 ### Manual download
 
-Get the `.dmg` (drag it to Applications) or the `.zip` from the [latest release](https://github.com/stigoleg/claude-account-switch/releases/latest), then clear the quarantine flag the same way.
+Get the notarized `.dmg` (drag it to Applications) or `.zip` from the [latest release](https://github.com/stigoleg/claude-account-switch/releases/latest).
 
 ### Requirements
 
@@ -65,17 +59,17 @@ macOS 14 (Sonoma) or newer. Building from source also requires the Swift 6 toolc
 
 ## Getting started
 
-1. Run the one time migration. On first launch the app offers to move your existing Claude data into a profile named `default`. Quit Claude Desktop, click Run Migration, and you are done. The data is moved, not copied, so nothing is duplicated or lost.
+1. Run the one-time migration. Version 1 profiles are first protected by a verified APFS copy-on-write backup. The active Desktop data is then moved to the real canonical directory without copying its contents. The backup is never deleted automatically.
 2. Add your second account. Open Manage Profiles, give the profile a name, and click Create + Sign In. The app walks you through both logins: Claude Desktop opens first, and once it has signed in, a Terminal window opens running `claude` for the CLI. Your claude.ai browser session carries over, so the second login is usually a single click. If only one of the two apps is installed, the sheet adapts.
 3. Switch whenever you like. Click the menu bar chip, the colored circle showing the active profile's initial, and pick a profile.
 
 ## Everyday use
 
-Each profile card shows separate badges for Desktop and the CLI, so you can always see where you are signed in. A green check means signed in, a grey cross means signed out. An orange "Can't verify" means there is a shared CLI keychain login that cannot be pinned to one profile; the shell integration described below fixes that.
+Each profile card shows separate badges for Desktop and the CLI. CLI status is verified by running `claude auth status` with that profile's own `CLAUDE_CONFIG_DIR`.
 
-Every card has a primary Sign in button plus a menu for Desktop only or CLI only. Signing out clears that profile's tokens and web session. It never touches the shared keychain entry that other profiles may depend on.
+Every card has a primary Sign in button plus a menu for Desktop only or CLI only. CLI sign-in and sign-out use Claude Code's own `auth` commands inside the selected profile.
 
-Starting a fresh account with an empty config? Open the profile's "..." menu and choose Copy Config From to bring over MCP servers, plugins, skills, commands and settings from another profile. Merge mode lists any conflicts and lets you pick a winner for each item. Overwrite mode mirrors the source and moves whatever it replaced to the Trash, so you can take it back. Credentials, login state, cookies and history are never copied.
+Starting a fresh account with an empty config? Open the profile's "..." menu and choose Copy Config From to bring over MCP servers, plugins, skills, commands and settings from another profile. Claude login state, cookies and history are excluded. Settings and MCP entries can contain their own API keys, so the review step requires an explicit warning acknowledgement when secret-shaped fields are detected.
 
 You can rename, recolor and delete profiles from each card. Deleted profiles go to the Trash, not into the void. And pressing Cmd+Q while the Manage Profiles window is focused will not kill the app; it keeps running in your menu bar, and you quit it from the menu bar dropdown.
 
@@ -91,30 +85,31 @@ cd ~/repos/work-monorepo
 claude   # runs as "work", regardless of the active profile
 ```
 
-A small zsh function finds the nearest `.claude-profile` file, points `CLAUDE_CONFIG_DIR` at that profile, and hands off to the real `claude`. As a welcome side effect, pinned projects get their own keychain entry per profile, which is exactly what clears up the "Can't verify" badge. You can also enable Suggest Desktop switches to get a notification when you enter a pinned project that does not match the active Desktop profile.
+A compiled dispatcher for zsh, bash and fish finds the nearest `.claude-profile` file, points `CLAUDE_CONFIG_DIR` at that profile, and hands off to the real `claude`. Use the profile UUID for new binding files; names and previous names remain supported. You can also enable Suggest Desktop switches to get a notification when you enter a pinned project that does not match the active Desktop profile.
 
-This is zsh only, since that is what macOS ships. The function file happens to be bash compatible if you want to source it yourself.
+Open a new shell after installing or repairing CLI integration. Directly invoking an absolute Claude binary path bypasses profile selection and is unsupported.
 
 ### Keep your profile list in sync across Macs
 
-Enable "Sync profiles via iCloud Drive" in the menu bar dropdown and your profile list stays consistent on every Mac signed into your iCloud account. Names, colors and deletions all sync. Conflicts resolve in favor of the newest change, and deletions are remembered so a removed profile cannot reappear from a stale machine. Credentials never sync; you sign in once per Mac.
+Enable "Sync profiles via iCloud Drive" in the menu bar dropdown and your profile list stays consistent on every Mac signed into your iCloud account. Names, colors and deletion requests sync using deterministic logical revisions rather than device clocks. A remote deletion never removes local bytes automatically: accept it to move an inactive profile to the Trash, or choose Keep on This Mac to retain the data under a new profile ID. Credentials never sync; you sign in once per Mac.
 
-### A caveat about CLI MCP servers
+### CLI isolation
 
-Claude Code keeps user level MCP servers in `~/.claude.json`, a file in your home folder that sits outside the switched directories. All profiles share it, along with your CLI identity. Per profile CLI MCP config exists only inside projects pinned via shell integration. Desktop MCP servers (`claude_desktop_config.json`) are fully per profile and switch and copy cleanly.
+Every CLI launch through the dispatcher uses its profile directory for settings, plugins, history and authentication. The v2 migration logs out the unsafe legacy global keychain context and guides you through one new CLI login per profile.
 
 ## Stepping away
 
-Menu bar → Disable & Restore Default Layout undoes everything safely. It quits Claude Desktop, removes the symlinks, and moves the active profile's data back to the original paths. Claude then behaves exactly as it did before the app existed. Other profiles stay on disk in case you return.
+Menu bar → Disable & Restore Default Layout keeps the real active Desktop directory in place, backs up the fallback CLI directory, restores the selected profile to `~/.claude`, and removes the managed shell hooks. Other profiles and migration backups remain on disk.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Menu bar says "No profile active" | The symlinks broke (OS update, manual `rm`). Switch to any profile to recreate them. |
+| Migration or recovery is required | Open Manage Profiles and use the health banner. Switching stays disabled until the layout is unambiguous. |
 | Claude Desktop will not quit during a switch | The app force quits after 8 seconds. If even that fails, quit it manually and retry. |
-| An open terminal still shows the old account | Running processes hold on to the old directory. A new terminal tab gets the new account. |
-| Want everything back to stock | Use Disable & Restore. Do not delete the symlinks by hand. |
+| An open terminal still shows the old account | Expected: existing CLI processes keep their account. Open a new terminal for the newly selected default. |
+| Need to verify or restore the migration backup | Use Verify Backup or Restore Backup in the green health banner. Restore first preserves the current v2 data under `Backups/pre-restore-v2-*`. |
+| Want everything back to stock | Use Disable & Restore. Do not move profile directories by hand. |
 
 ## Building from source
 
@@ -124,6 +119,8 @@ make build      # ./build/Claude Profile Switcher.app
 make run        # build + launch
 make test       # unit tests
 make lint       # swift format lint
+make signing-check   # validate Developer ID + provisioning prerequisites
+make notarized-dist  # signed, notarized and stapled production artifacts
 make install    # copy into /Applications
 make dist       # release artifacts (.zip, .dmg, SHA256SUMS) in ./dist
 make clean      # remove .build, ./build, ./dist
@@ -132,23 +129,25 @@ make xcode      # open the package in Xcode
 
 A tip: Xcode's Run button launches the bare executable without `LSUIElement`, so a Dock icon appears. For the real menu bar experience, use `make run`.
 
+Public releases require Developer ID, the iCloud provisioning profile and notarization. See [SIGNING.md](SIGNING.md) for the complete local and GitHub Actions setup.
+
 ## CI & releases
 
-[`build.yml`](.github/workflows/build.yml) runs on every push and PR to `main`: lint, tests, and a build on a macOS 14 + 15 matrix. Pushes upload the built `.app` as a short lived artifact.
+[`build.yml`](.github/workflows/build.yml) runs on every push and PR to `main`: lint, tests, signature verification and builds on macOS 14, 15 and 26. Pushes upload the newest-runner `.app` as a short-lived artifact.
 
 [`release.yml`](.github/workflows/release.yml) runs on a `v*` tag: tests, a version guard, `make dist`, a GitHub Release with the zip, dmg, SHA256SUMS and generated notes, and finally a Homebrew cask bump in [`stigoleg/homebrew-tap`](https://github.com/stigoleg/homebrew-tap).
 
 Cutting a release is one command:
 
 ```bash
-git tag v1.4.0 && git push origin v1.4.0
+git tag v2.0.0-rc.1 && git push origin v2.0.0-rc.1
 ```
 
 The git tag is the single source of truth for the version. `AppBundle/Info.plist` holds template values that `build-app.sh` stamps at build time (`CFBundleVersion` is the commit count), and untagged local builds are stamped `0.0.0-dev`. The cask bump needs the `TAP_GITHUB_TOKEN` repo secret, a fine grained PAT with contents read and write access scoped to the tap repo only. Without it, that job skips with a warning.
 
 ## Good to know
 
-The app is unsigned by choice: ad hoc signed, not notarized, hence the one time Gatekeeper step. The release workflow has a ready slot for Developer ID signing if that ever changes.
+Production releases are Developer ID signed with hardened runtime and notarized. The embedded CLI dispatcher is signed separately before the app bundle is sealed.
 
 Your data stays put. Profile data lives unencrypted on disk with normal filesystem permissions, the same as Claude's own defaults. iCloud sync carries metadata only; tokens and conversations never leave the machine.
 
@@ -158,9 +157,10 @@ There is no sandbox, and that is deliberate. The whole point of the app is manag
 
 ```
 Sources/
-├── ClaudeProfileSwitcher/         executable shim (@main only)
+├── ClaudeProfileSwitcher/         menu-bar executable (@main only)
+├── ClaudeProfileDispatcher/       compiled CLI profile dispatcher
 └── ClaudeProfileSwitcherCore/     library: Models, Services, UI
-Tests/ClaudeProfileSwitcherCoreTests/   XCTest suite (80 tests)
+Tests/ClaudeProfileSwitcherCoreTests/   XCTest and dispatcher integration suite
 AppBundle/                         Info.plist + entitlements + icon
 Packaging/homebrew/                cask template for the tap
 Scripts/                           version stamping, dmg, icon generation

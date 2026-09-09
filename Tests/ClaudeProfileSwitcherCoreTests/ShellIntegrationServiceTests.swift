@@ -112,4 +112,55 @@ final class ShellIntegrationServiceTests: XCTestCase {
             FileManager.default.fileExists(atPath: svc.zshrcURL.path),
             "force-install must not touch the rc file")
     }
+
+    func testDispatcherManifestUsesUUIDNamesAliasesAndActiveProfile() throws {
+        let (tmp, cleanup) = try TestSupport.makeTempDirectory()
+        defer { cleanup() }
+        let store = ProfileStore(supportRoot: tmp.appendingPathComponent("support"))
+        store.load()
+        var profile = Profile(name: "Sopra Steria", aliases: ["Work Account"])
+        try store.upsertThrowing(profile)
+        profile = try XCTUnwrap(store.profiles.first)
+        try store.setActiveThrowing(profile)
+        let service = makeService(in: tmp, store: store)
+
+        XCTAssertNil(service.writeProfilePathsManifest())
+        let manifest = try JSONDecoder().decode(
+            CLIProfileDispatcherManifest.self,
+            from: Data(contentsOf: service.dispatcherManifestURL))
+        XCTAssertEqual(manifest.schemaVersion, 2)
+        XCTAssertEqual(manifest.activeProfileID, profile.id)
+        XCTAssertEqual(manifest.profile(matching: "Sopra Steria")?.id, profile.id)
+        XCTAssertEqual(manifest.profile(matching: " work account ")?.id, profile.id)
+        XCTAssertEqual(manifest.profile(matching: profile.id.uuidString)?.id, profile.id)
+    }
+
+    func testInstallAllSupportedShellsInstallsSignedDispatcherPath() throws {
+        let (tmp, cleanup) = try TestSupport.makeTempDirectory()
+        defer { cleanup() }
+        let store = ProfileStore(supportRoot: tmp.appendingPathComponent("support"))
+        store.load()
+        let helper = tmp.appendingPathComponent("ClaudeProfileDispatcher")
+        try "#!/bin/sh\nexit 0\n".write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        let service = ShellIntegrationService(
+            store: store,
+            configDirectoryOverride: tmp.appendingPathComponent("config"),
+            zshrcOverride: tmp.appendingPathComponent("zshrc"),
+            shellIsZshOverride: true,
+            bashrcOverride: tmp.appendingPathComponent("bashrc"),
+            bashProfileOverride: tmp.appendingPathComponent("bash_profile"),
+            fishConfigOverride: tmp.appendingPathComponent("fish/config.fish"),
+            dispatcherSourceOverride: helper)
+
+        try service.installAllSupportedShells()
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: service.dispatcherURL.path))
+        XCTAssertTrue(service.integrationStatuses().allSatisfy(\.installed))
+        XCTAssertTrue(
+            try String(contentsOf: tmp.appendingPathComponent("bashrc"), encoding: .utf8)
+                .contains("claude-profile.zsh"))
+        XCTAssertTrue(
+            try String(contentsOf: tmp.appendingPathComponent("fish/config.fish"), encoding: .utf8)
+                .contains("fish_add_path"))
+    }
 }

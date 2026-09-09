@@ -4,5 +4,15 @@
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <false/>
+    <key>com.apple.developer.ubiquity-container-identifiers</key>
+    <array>
+        <string>iCloud.com.stigole.ClaudeProfileSwitcher</string>
+    </array>
+    <key>com.apple.developer.icloud-services</key>
+    <array>
+        <string>CloudDocuments</string>
+    </array>
+    <key>com.apple.developer.ubiquity-kvstore-identifier</key>
+    <string>$(TeamIdentifierPrefix)com.stigole.ClaudeProfileSwitcher</string>
 </dict>
 </plist>
