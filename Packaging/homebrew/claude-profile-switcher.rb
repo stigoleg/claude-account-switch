@@ -14,7 +14,7 @@ cask "claude-profile-switcher" do
   desc "Menu-bar app for switching between multiple Claude accounts (Desktop + CLI)"
   homepage "https://github.com/stigoleg/claude-account-switch"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Claude Profile Switcher.app"
 
