@@ -136,6 +136,38 @@ final class ProfileLayoutServiceTests: XCTestCase {
         XCTAssertFalse(try h.layout.verifyBackup(backup))
     }
 
+    func testBackupVerificationAllowsGroupNormalization() throws {
+        let h = try makeHarness()
+        defer { h.cleanup() }
+
+        let backup = try h.layout.createPreV2Backup(profiles: [h.active, h.target])
+        let copied = backup.directory
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(h.target.id.uuidString)
+            .appendingPathComponent("desktop/value")
+
+        // APFS clone/cp may normalize a group the caller cannot reproduce.
+        // The backup remains valid when bytes, type, mode, ACLs and xattrs match.
+        XCTAssertEqual(chown(copied.path, uid_t.max, 80), 0)
+        XCTAssertTrue(try h.layout.verifyBackup(backup))
+    }
+
+    func testBackupVerificationIgnoresCopySpecificProvenance() throws {
+        let h = try makeHarness()
+        defer { h.cleanup() }
+        let source = h.store.desktopDirectory(h.target).appendingPathComponent("value")
+        try setExtendedAttribute("com.apple.provenance", value: "source", at: source)
+
+        let backup = try h.layout.createPreV2Backup(profiles: [h.active, h.target])
+        let copied = backup.directory
+            .appendingPathComponent("profiles")
+            .appendingPathComponent(h.target.id.uuidString)
+            .appendingPathComponent("desktop/value")
+        try setExtendedAttribute("com.apple.provenance", value: "copy", at: copied)
+
+        XCTAssertTrue(try h.layout.verifyBackup(backup))
+    }
+
     private func setExtendedAttribute(_ name: String, value: String, at url: URL) throws {
         let bytes = Array(value.utf8)
         let result = bytes.withUnsafeBytes { buffer in

@@ -1016,12 +1016,22 @@ public struct ProfileLayoutService: ProfileLayoutServicing, @unchecked Sendable 
         guard url.path.withCString({ lstat($0, &info) }) == 0 else {
             throw ProfileLayoutError.backupFailed("could not stat \(url.path): \(String(cString: strerror(errno)))")
         }
+        // `com.apple.provenance` is rewritten by macOS when an item is copied,
+        // including for APFS clones. It describes the copy operation rather
+        // than profile content, so it cannot be compared byte-for-byte. All
+        // other xattrs (including ACL-related metadata) remain verified.
         let attributes = try extendedAttributes(at: url)
+            .filter { $0.key != "com.apple.provenance" }
         let xattrManifest = attributes.sorted(by: { $0.key < $1.key }).map { name, value in
             let digest = SHA256.hash(data: value).map { String(format: "%02x", $0) }.joined()
             return "\(name)=\(digest)"
         }.joined(separator: ",")
-        return "mode=\(info.st_mode);uid=\(info.st_uid);gid=\(info.st_gid);xattrs=\(xattrManifest)"
+        // A non-privileged APFS clone preserves content, mode, ACLs and xattrs,
+        // but macOS normalizes a source group the current user does not belong
+        // to (for example gid 0) to the user's primary group. Ownership is not
+        // part of the documented backup acceptance criteria and rejecting that
+        // safe normalization makes otherwise complete backups impossible.
+        return "mode=\(info.st_mode);xattrs=\(xattrManifest)"
     }
 
     private func extendedAttributes(at url: URL) throws -> [String: Data] {

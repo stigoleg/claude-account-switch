@@ -36,10 +36,19 @@ public struct FirstRunMigrationView: View {
                 }
             }
 
+            if let error = vm.lastError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("migration-error")
+            }
+
             HStack {
                 Spacer()
                 Button("Later") { vm.showMigrationSheet = false }
                 Button("Run Migration") {
+                    vm.lastError = nil
                     vm.performMigration()
                 }
                 .keyboardShortcut(.defaultAction)
