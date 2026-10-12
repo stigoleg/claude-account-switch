@@ -1,201 +1,117 @@
 # Claude Profile Switcher
 
-A macOS menu bar app for people who use more than one Claude account on the same Mac. It keeps each account in its own profile and switches between them with a single click. One switch covers both Claude Desktop and Claude Code (the CLI), and you keep using both apps exactly as you always have.
+A macOS menu bar app for using several Claude accounts on one Mac. Each account gets its own profile, and one click switches both Claude Desktop and Claude Code (the CLI).
 
 > Not affiliated with Anthropic. A personal tool, shared as is.
 
 [![build](https://github.com/stigoleg/claude-account-switch/actions/workflows/build.yml/badge.svg)](https://github.com/stigoleg/claude-account-switch/actions/workflows/build.yml)
 
-## Why this exists
+## Why
 
-Claude assumes you have one account per Mac. Both apps keep their settings and login state at fixed locations:
-
-- `~/.claude` for Claude Code
-- `~/Library/Application Support/Claude/` for Claude Desktop
-
-When you sign in with a second account, it overwrites the first. So you end up signing out and back in several times a day, losing your place each time. The usual workaround is the `CLAUDE_CONFIG_DIR` environment variable, but it only affects the CLI, and only in terminals where you remember to set it. Claude Desktop ignores it completely.
+Claude assumes one account per Mac: Claude Code keeps its state in `~/.claude`, Claude Desktop in `~/Library/Application Support/Claude`. Signing in with a second account overwrites the first. `CLAUDE_CONFIG_DIR` only helps the CLI, and only where you remember to set it.
 
 ## How it works
 
-Every account gets isolated Desktop and CLI data, kept together in one place:
-
 ```
-~/Library/Application Support/ClaudeProfileSwitcher/
-└── profiles/
-    ├── <personal>/
-    │   ├── cli/        ← selected with CLAUDE_CONFIG_DIR
-    │   └── desktop/    ← stored here while this profile is inactive
-    └── <work>/
-        ├── cli/
-        └── desktop/
+~/Library/Application Support/ClaudeProfileSwitcher/profiles/
+├── <personal>/
+│   ├── cli/        ← used through CLAUDE_CONFIG_DIR
+│   └── desktop/    ← parked here while the profile is inactive
+└── <work>/
+    ├── cli/
+    └── desktop/
 ```
 
-The active Desktop profile always lives at the real `~/Library/Application Support/Claude` directory, so Cowork can mount paths beneath it without crossing a symlink. Switching uses a journaled atomic APFS directory swap. Claude Code runs through a compiled dispatcher that sets a profile-specific `CLAUDE_CONFIG_DIR`; existing CLI sessions keep their account and new sessions use the selected profile.
+- **Desktop:** the active profile always lives at the real `~/Library/Application Support/Claude` (no symlink, so Cowork works). Switching swaps directories atomically on APFS, with a journal for crash recovery.
+- **CLI:** a small dispatcher installed as `claude` sets the right `CLAUDE_CONFIG_DIR` and starts the real binary. Running sessions keep their account; new ones use the selected profile.
 
 ## Install
-
-### Homebrew (recommended)
 
 ```bash
 brew tap stigoleg/tap
 brew install --cask claude-profile-switcher
 ```
 
-Update with `brew update && brew upgrade --cask claude-profile-switcher`, then quit and reopen the app from the menu bar.
+Update with `brew update && brew upgrade --cask claude-profile-switcher`, then reopen the app. If Homebrew warns that the tap is untrusted, run `brew trust --cask stigoleg/tap/claude-profile-switcher`.
 
-Newer Homebrew versions warn that taps outside Homebrew's own are untrusted. The install still works, and you can trust this cask with:
-
-```bash
-brew trust --cask stigoleg/tap/claude-profile-switcher
-```
-
-Version 2 releases are Developer ID signed, hardened and notarized. Release assets include SHA-256 checksums and an SPDX software bill of materials.
-
-### Manual download
-
-Get the notarized `.dmg` (drag it to Applications) or `.zip` from the [latest release](https://github.com/stigoleg/claude-account-switch/releases/latest).
-
-### Requirements
-
-macOS 14 (Sonoma) or newer. Building from source also requires the Swift 6 toolchain (Xcode 16 or later).
+Or download the notarized `.dmg` or `.zip` from the [latest release](https://github.com/stigoleg/claude-account-switch/releases/latest). Requires macOS 14 (Sonoma) or newer.
 
 ## Getting started
 
-1. Run the one-time migration. Version 1 profiles are first protected by a verified APFS copy-on-write backup. The active Desktop data is then moved to the real canonical directory without copying its contents. The backup is never deleted automatically.
-2. Add your second account. Open Manage Profiles, give the profile a name, and click Create + Sign In. The app walks you through both logins: Claude Desktop opens first, and once it has signed in, a Terminal window opens running `claude` for the CLI. Your claude.ai browser session carries over, so the second login is usually a single click. If only one of the two apps is installed, the sheet adapts.
-3. Switch whenever you like. Click the menu bar chip, the colored circle showing the active profile's initial, and pick a profile.
+1. **Migrate (once).** Existing v1 profiles are backed up first (verified APFS copy-on-write); the backup is never deleted automatically.
+2. **Add an account.** Manage Profiles → name → Create + Sign In. Desktop signs in first, then a Terminal opens `claude` for the CLI login.
+3. **Switch.** Click the colored circle in the menu bar and pick a profile.
 
-## Everyday use
+## Features
 
-Each profile card shows separate badges for Desktop and the CLI. CLI status is verified by running `claude auth status` with that profile's own `CLAUDE_CONFIG_DIR`.
+**Profiles.** Each card shows Desktop and CLI sign-in status, with sign-in/out per app. Rename, recolor, or delete (to the Trash). Copy Config From brings MCP servers, plugins, skills and settings from another profile, never logins or history, and warns when secrets are detected.
 
-Every card has a primary Sign in button plus a menu for Desktop only or CLI only. CLI sign-in and sign-out use Claude Code's own `auth` commands inside the selected profile.
-
-Starting a fresh account with an empty config? Open the profile's "..." menu and choose Copy Config From to bring over MCP servers, plugins, skills, commands and settings from another profile. Claude login state, cookies and history are excluded. Settings and MCP entries can contain their own API keys, so the review step requires an explicit warning acknowledgement when secret-shaped fields are detected.
-
-You can rename, recolor and delete profiles from each card. Deleted profiles go to the Trash, not into the void. And pressing Cmd+Q while the Manage Profiles window is focused will not kill the app; it keeps running in your menu bar, and you quit it from the menu bar dropdown.
-
-## Power features
-
-### Pin a project to an account
-
-Some repos should always use the work account, no matter what the menu bar says. Install shell integration from Manage Profiles, then drop a one line file into the project:
+**Pin a project to an account.** Install shell integration (zsh, bash, fish) from Manage Profiles, then:
 
 ```bash
-echo "work" > ~/repos/work-monorepo/.claude-profile
-cd ~/repos/work-monorepo
-claude   # runs as "work", regardless of the active profile
+echo "work" > ~/repos/work-monorepo/.claude-profile   # claude in this tree always runs as "work"
 ```
 
-A compiled dispatcher for zsh, bash and fish finds the nearest `.claude-profile` file, points `CLAUDE_CONFIG_DIR` at that profile, and hands off to the real `claude`. Use the profile UUID for new binding files; names and previous names remain supported. You can also enable Suggest Desktop switches to get a notification when you enter a pinned project that does not match the active Desktop profile.
+Optionally get a notification when you enter a pinned project that doesn't match the active Desktop profile. Open a new shell after installing.
 
-Open a new shell after installing or repairing CLI integration. Directly invoking an absolute Claude binary path bypasses profile selection and is unsupported.
+**iCloud sync.** "Sync profiles via iCloud Drive" keeps names, colors and deletions consistent across your Macs. Credentials never sync, and a remote deletion never removes local data without asking.
 
-### Keep your profile list in sync across Macs
+**Shared Claude setup (optional).** A bundled Claude Code setup you can install per profile: a `CLAUDE.md` operating model, four subagents (`code-scout`, `doc-researcher`, `implementer`, `verifier`) with the Karpathy coding principles built in, three skills, a status line, and a hook that pins subagent models. Install it from a profile's … menu or when creating a profile.
+- Your own skills, hooks and settings are kept, and `settings.json` is backed up first.
+- "Bypass permission prompts" (yolo) is a separate opt-in that is off by default.
+- The status line and the hook need [jq](https://jqlang.org) (`brew install jq`).
+- Details and developer scripts are in [`SharedConfig/`](SharedConfig/README.md).
 
-Enable "Sync profiles via iCloud Drive" in the menu bar dropdown and your profile list stays consistent on every Mac signed into your iCloud account. Names, colors and deletion requests sync using deterministic logical revisions rather than device clocks. A remote deletion never removes local bytes automatically: accept it to move an inactive profile to the Trash, or choose Keep on This Mac to retain the data under a new profile ID. Credentials never sync; you sign in once per Mac.
-
-### CLI isolation
-
-Every CLI launch through the dispatcher uses its profile directory for settings, plugins, history and authentication. The v2 migration logs out the unsafe legacy global keychain context and guides you through one new CLI login per profile.
-
-### Shared Claude setup (optional)
-
-The app bundles a curated Claude Code setup: a `CLAUDE.md` operating model, four subagents (`code-scout`, `doc-researcher`, `implementer`, `verifier`), three skills, a status line, and a hook that pins subagents to an explicit model. The coding agents have the four Karpathy coding principles built in (think before coding, simplicity first, surgical changes, goal-driven execution). It is opt-in per profile: Manage Profiles → a profile's … menu → Install Shared Claude Setup…, or the checkbox when you create a profile.
-
-- The files are copied to `~/.config/claude-shared` and the profile's `cli/` links `CLAUDE.md`, `agents` and each shared skill there. Profile-local skills, other hooks and other settings stay. `settings.json` is backed up before it changes; an existing `model` choice is kept.
-- **Bypass permission prompts (yolo)** is a separate checkbox, off by default. It sets `permissions.defaultMode: "bypassPermissions"` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs tools, edits files and executes commands without asking. Only enable it where you accept that.
-- The card shows "Shared setup", plus "yolo" and "update available" when they apply. Diagnose & Repair reports broken links and available updates; its reinstall asks before it changes anything and never touches the permission settings. If `~/.config/claude-shared` was edited by hand (or, for a copy made by `install.sh`, differs from the bundled setup), the app asks before replacing it and keeps the old copy as `~/.config/claude-shared.backup-<timestamp>`.
-- The status line and the subagent model hook need [jq](https://jqlang.org) (`brew install jq`); without it they silently do nothing. macOS 14 ships no jq, so the install sheet and Diagnose & Repair warn when it is missing.
-- Remove it with Remove Shared Claude Setup in the same menu. That removes the links and the settings values the setup wrote; your `model` and everything else stay.
-
-The canonical copy and the developer scripts (`install.sh`, `verify.sh`) live in [`SharedConfig/`](SharedConfig/README.md).
-
-## Stepping away
-
-Menu bar → Disable & Restore Default Layout keeps the real active Desktop directory in place, backs up the fallback CLI directory, restores the selected profile to `~/.claude`, and removes the managed shell hooks. Other profiles and migration backups remain on disk.
-
-## Diagnose & Repair
-
-Menu bar → Diagnose & Repair… (also under More in Manage Profiles) checks the profile layout, every Desktop profile's Cowork VM files, and the Claude Code shell integration. Checking never changes anything. Each problem has a Fix button where the app can repair it, and Copy Report puts a plain-text report on the clipboard for support. Reveal Repairs Folder appears once a repair has moved something aside.
-
-Without opening the app, the same report is available from Terminal:
+**Diagnose & Repair.** Menu bar → Diagnose & Repair… checks the profile layout, Claude Desktop's Cowork VM files, the shell integration and the shared setup. Checking changes nothing. Fixes are per item, and Copy Report gives text you can paste into a support request. The same report works without the UI:
 
 ```sh
-"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor          # text report
-"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor --json   # JSON report
-"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor --fix    # safe repairs, then report
+"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor [--json] [--fix]
 ```
 
-`--doctor` exits 1 when it finds errors or warnings. `--fix` only runs safe repairs: it moves broken Cowork VM folders aside, removes stale temporary links and reinstalls the shell integration. It refuses while the menu bar app is running (use the window instead), never runs the layout migration, and never reinstalls the shared Claude setup; it prints which findings need the app.
-
-**"failed to open SDK binary … claude-code-vm/<version>/claude: too many levels of symbolic links".** Cowork's Linux VM opens Claude Desktop's files through virtiofs and refuses symlinks anywhere in the path. Either `~/Library/Application Support/Claude` is still a legacy v1 symlink (run the migration from Manage Profiles), or a symlink sits inside `claude-code-vm` or `vm_bundles`. In the Diagnose & Repair window the repair quits Claude Desktop first (after asking); `--doctor --fix` instead refuses to move the folder while Claude Desktop runs, so quit it and run again. The folder is moved to `~/Library/Application Support/ClaudeProfileSwitcher/repairs/<timestamp>/`; nothing is deleted, and Claude Desktop downloads a fresh copy the next time Cowork starts. The moved folder keeps using disk space (`vm_bundles` can be many GB): delete it from the repairs folder once Claude Desktop works again. A symlinked `~/Library` or home folder is reported but must be fixed by hand.
+`--fix` only runs safe repairs and refuses while the menu bar app or Claude Desktop is running.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Migration or recovery is required | Open Manage Profiles and use the health banner, or Diagnose & Repair. Switching stays disabled until the layout is unambiguous. |
-| Claude Desktop will not quit during a switch | The app force quits after 8 seconds. If even that fails, quit it manually and retry. |
-| An open terminal still shows the old account | Expected: existing CLI processes keep their account. Open a new terminal for the newly selected default. |
-| Need to verify or restore the migration backup | Use Verify Backup or Restore Backup in the green health banner. Restore first preserves the current v2 data under `Backups/pre-restore-v2-*`. |
-| Want everything back to stock | Use Disable & Restore. Do not move profile directories by hand. |
+| Cowork: `failed to open SDK binary … too many levels of symbolic links` | Run Diagnose & Repair. Either the Desktop folder is still a v1 symlink (fix: migrate), or there is a symlink in `claude-code-vm`/`vm_bundles`. The fix moves that folder to `ClaudeProfileSwitcher/repairs/` and Desktop downloads a fresh one. Delete the moved copy once Desktop works, because `vm_bundles` can be many GB. |
+| "Migration or recovery required" | Use the button in the Manage Profiles banner, or Diagnose & Repair. Switching stays disabled until the layout is safe. |
+| An open terminal still uses the old account | Expected. Open a new terminal. |
+| Claude Desktop won't quit during a switch | The app force quits after 8 seconds. If that fails, quit it manually and retry. |
+| Restore the migration backup | Use Verify Backup or Restore Backup in the Manage Profiles banner. |
+| Want everything back to stock | Menu bar → Disable & Restore Default Layout. It restores the selected profile to `~/.claude` and removes the shell hooks. Other profiles and backups stay on disk. Don't move profile folders by hand. |
 
-## Building from source
+## Privacy
+
+Profile data stays on disk with normal permissions, as with Claude's own defaults. iCloud sync carries metadata only. The app isn't sandboxed, because managing files outside its own container is its job. Releases are Developer ID signed, hardened and notarized, with SHA-256 checksums and an SPDX SBOM.
+
+## Development
+
+Requires the Swift 6 toolchain (Xcode 16+).
 
 ```bash
-make            # list all targets
-make build      # ./build/Claude Profile Switcher.app
-make run        # build + launch
-make test       # unit tests
-make lint       # swift format lint
-make signing-check   # validate Developer ID + provisioning prerequisites
-make notarized-dist  # signed, notarized and stapled production artifacts
-make install    # copy into /Applications
-make dist       # release artifacts (.zip, .dmg, SHA256SUMS) in ./dist
-make clean      # remove .build, ./build, ./dist
-make xcode      # open the package in Xcode
+make build    # ./build/Claude Profile Switcher.app
+make run      # build and launch (use this, not Xcode's Run, to get the menu bar behaviour)
+make test     # unit tests
+make lint     # swift format lint
+make          # all targets
 ```
 
-A tip: Xcode's Run button launches the bare executable without `LSUIElement`, so a Dock icon appears. For the real menu bar experience, use `make run`.
-
-Public releases require Developer ID, the iCloud provisioning profile and notarization. See [SIGNING.md](SIGNING.md) for the complete local and GitHub Actions setup.
-
-## CI & releases
-
-[`build.yml`](.github/workflows/build.yml) runs on every push and PR to `main`: lint, tests, signature verification and builds on macOS 14, 15 and 26. Pushes upload the newest-runner `.app` as a short-lived artifact.
-
-Releases are built, signed and notarized locally, so the Developer ID key never leaves the Mac. Put the signing values in `.env` (gitignored; see [SIGNING.md](SIGNING.md)), then:
+**Releasing.** Signing and notarization run locally, so the Developer ID key never leaves the Mac. Put the signing values in `.env` (gitignored, see [SIGNING.md](SIGNING.md)), then run:
 
 ```bash
-make release-check VERSION=2.1.0   # lint, tests, signed + notarized dist/, nothing pushed
+make release-check VERSION=2.1.0   # lint, tests, signed and notarized dist/; pushes nothing
 make release VERSION=2.1.0         # the same, then tag, push and create the GitHub release
 ```
 
-Publishing the release triggers [`cask.yml`](.github/workflows/cask.yml), which renders `Packaging/homebrew/` into [`stigoleg/homebrew-tap`](https://github.com/stigoleg/homebrew-tap). Versions with a suffix such as `2.1.0-rc.1` become GitHub prereleases and leave the cask alone. [`release.yml`](.github/workflows/release.yml) is a manual fallback that releases an existing tag from CI and needs the signing secrets.
-
-The git tag is the single source of truth for the version. `AppBundle/Info.plist` holds template values that `build-app.sh` stamps at build time (`CFBundleVersion` is the commit count), and untagged local builds are stamped `0.0.0-dev`. The cask bump needs the `TAP_GITHUB_TOKEN` repo secret, a fine grained PAT with contents read and write access scoped to the tap repo only. Without it, that job skips with a warning.
-
-## Good to know
-
-Production releases are Developer ID signed with hardened runtime and notarized. The embedded CLI dispatcher is signed separately before the app bundle is sealed.
-
-Your data stays put. Profile data lives unencrypted on disk with normal filesystem permissions, the same as Claude's own defaults. iCloud sync carries metadata only; tokens and conversations never leave the machine.
-
-There is no sandbox, and that is deliberate. The whole point of the app is managing files outside its own container.
-
-## Repo layout
+The published release triggers [`cask.yml`](.github/workflows/cask.yml), which updates [`stigoleg/homebrew-tap`](https://github.com/stigoleg/homebrew-tap) from `Packaging/homebrew/`. Versions such as `2.1.0-rc.1` become prereleases and leave the cask alone. [`build.yml`](.github/workflows/build.yml) runs lint, tests and builds on macOS 14, 15 and 26 for every push and PR. [`release.yml`](.github/workflows/release.yml) is a manual CI fallback that needs the signing secrets. The git tag is the version; untagged builds are `0.0.0-dev`.
 
 ```
-Sources/
-├── ClaudeProfileSwitcher/         menu-bar executable (@main only)
-├── ClaudeProfileDispatcher/       compiled CLI profile dispatcher
-└── ClaudeProfileSwitcherCore/     library: Models, Services, UI
-Tests/ClaudeProfileSwitcherCoreTests/   XCTest and dispatcher integration suite
-AppBundle/                         Info.plist + entitlements + icon
-Packaging/homebrew/                cask template for the tap
-SharedConfig/                      optional shared Claude setup, bundled into the app
-Scripts/                           version stamping, dmg, icon generation
-.github/workflows/                 build.yml, release.yml, cask.yml
-Makefile, build-app.sh             build / test / package
+Sources/ClaudeProfileSwitcher/       app entry point (+ --doctor)
+Sources/ClaudeProfileDispatcher/     CLI profile dispatcher
+Sources/ClaudeProfileSwitcherCore/   models, services, UI
+Tests/                               XCTest suite
+SharedConfig/                        optional shared Claude setup, bundled into the app
+Packaging/homebrew/                  cask template
+Scripts/, Makefile, build-app.sh     build, sign, package, release
 ```
