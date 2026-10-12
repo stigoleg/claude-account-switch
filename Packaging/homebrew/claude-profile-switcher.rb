@@ -1,10 +1,10 @@
 # Homebrew cask for Claude Profile Switcher.
 #
-# This file is the template for the tap repo — copy it to
-# stigoleg/homebrew-tap as Casks/claude-profile-switcher.rb. After that, the
-# release workflow's `update-cask` job keeps `version` and `sha256` current on
-# every tagged release (requires the TAP_GITHUB_TOKEN secret; see
-# .github/workflows/release.yml).
+# This file is the source of truth for stigoleg/homebrew-tap
+# Casks/claude-profile-switcher.rb. On every tagged release the workflow's
+# `update-cask` job renders it into the tap with the release's `version` and
+# `sha256` (requires the TAP_GITHUB_TOKEN secret; see
+# .github/workflows/release.yml). Edit stanzas and caveats here, not in the tap.
 cask "claude-profile-switcher" do
   version "1.3.0"
   sha256 "PLACEHOLDER_UPDATED_BY_RELEASE_WORKFLOW"

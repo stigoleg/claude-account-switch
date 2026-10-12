@@ -81,6 +81,11 @@ public struct MenuBarView: View {
 
         Divider()
 
+        Button(vm.diagnosticsHasErrors ? "Diagnose & Repair… (issues found)" : "Diagnose & Repair…") {
+            openWindow(id: "diagnostics")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
         Button("Disable & Restore Default Layout…") {
             vm.requestDisableAndRestore()
         }

@@ -17,6 +17,8 @@ public final class AppViewModel {
     /// Which Claude surfaces (Desktop / CLI) are installed on this machine.
     /// The UI reads this to hide or disable impossible options.
     public let surfaces: SurfaceAvailability
+    public let diagnostics: DiagnosticsService
+    public let sharedConfig: SharedConfigService
 
     public var isSwitching = false
     public var lastError: String?
@@ -27,6 +29,8 @@ public final class AppViewModel {
     public var pendingSignInProfile: Profile?  // shown as a sheet after Create
     /// The TARGET profile of a "Copy config from…" action; drives the sheet.
     public var copyConfigTarget: Profile?
+    /// The profile the shared Claude setup sheet installs into.
+    public var sharedConfigTarget: Profile?
     public var signInPhase: ProfileManager.SignInPhase?
     public var signingInProfileID: UUID?
     /// When a sign-in started — drives the elapsed-time display.
@@ -43,6 +47,8 @@ public final class AppViewModel {
     public private(set) var loginStatuses: [UUID: ProfileLoginStatus] = [:]
     public private(set) var shellIntegrationInstalled: Bool = false
     public var backupVerificationMessage: String?
+    public private(set) var diagnosticFindings: [DiagnosticFinding] = []
+    public private(set) var sharedConfigStatuses: [UUID: SharedConfigStatus] = [:]
 
     // Toggle state must live as stored properties so @Observable can track
     // it. The earlier computed-property version wrapped UserDefaults and
@@ -115,6 +121,19 @@ public final class AppViewModel {
             self.sync = ProfileSyncService(store: s)
         }
         self.desktopHint = DesktopHintWatcher(store: s)
+        let home =
+            testRoot?.appendingPathComponent("home", isDirectory: true)
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        self.sharedConfig = SharedConfigService(
+            bundleURL: SharedConfigService.bundledResourceURL,
+            deployedURL: SharedConfigService.deployedURL(home: home),
+            profilesDirectory: s.profilesDirectory,
+            runner: testRoot == nil ? ClaudeCodeRunner(timeout: 300) : TestModeClaudeCodeRunner())
+        self.diagnostics = DiagnosticsService(
+            manager: manager,
+            shellIntegration: shellIntegration,
+            home: home,
+            sharedConfig: sharedConfig)
         self.surfaces =
             testRoot == nil
             ? SurfaceAvailability()
@@ -165,6 +184,7 @@ public final class AppViewModel {
         if let error = shellIntegration.writeProfilePathsManifest() {
             lastError = error
         }
+        runDiagnostics()
     }
 
     /// Re-stat every profile's credential files. The file inspection is sync
@@ -180,6 +200,7 @@ public final class AppViewModel {
             next[p.id] = manager.credentials.status(for: p, activeProfileID: store.activeProfileID)
         }
         loginStatuses = next
+        refreshSharedConfigStatuses()
 
         // Then off-main keychain probe to fill in the .unknown notes.
         let inspector = manager.credentials
@@ -358,11 +379,14 @@ public final class AppViewModel {
         }
     }
 
-    public func createProfile(named name: String) {
+    public func createProfile(named name: String, installSharedConfig: Bool = false) {
         do {
             let profile = try manager.createProfile(name: name)
             refreshLoginStatuses()
             pendingSignInProfile = profile
+            if installSharedConfig {
+                self.installSharedConfig(profile, yolo: nil, documentSkills: false)
+            }
         } catch {
             reportError(error.localizedDescription)
         }
@@ -592,6 +616,107 @@ public final class AppViewModel {
         }
     }
 
+    // MARK: - Shared Claude setup
+
+    public func refreshSharedConfigStatuses() {
+        var next: [UUID: SharedConfigStatus] = [:]
+        for p in store.profiles {
+            next[p.id] = sharedConfig.status(profileID: p.id)
+        }
+        sharedConfigStatuses = next
+    }
+
+    public func sharedConfigStatus(for profile: Profile) -> SharedConfigStatus {
+        sharedConfigStatuses[profile.id] ?? .notInstalled
+    }
+
+    /// Default for the new-profile checkbox.
+    public var anyProfileHasSharedConfig: Bool {
+        sharedConfigStatuses.values.contains { $0 != .notInstalled }
+    }
+
+    /// Install or update the shared setup in one profile. `yolo`: true sets
+    /// the permission keys, false removes them (sheet unchecked), nil leaves
+    /// them alone.
+    public func installSharedConfig(_ profile: Profile, yolo: Bool?, documentSkills: Bool) {
+        var overwrite = false
+        if sharedConfig.deployedHasLocalEdits() {
+            guard confirmOverwriteSharedEdits() else { return }
+            overwrite = true
+        }
+        runExclusive { [self] in
+            defer {
+                refreshSharedConfigStatuses()
+                runDiagnostics()
+            }
+            let outcome = try sharedConfig.install(profileID: profile.id, yolo: yolo, overwriteLocalEdits: overwrite)
+            store.appendLog("shared-config: installed in \(profile.id) (yolo: \(yolo.map(String.init) ?? "unchanged"))")
+            reportKeptSharedCopy(outcome)
+            guard documentSkills else { return }
+            let failures = await sharedConfig.installDocumentSkills(profileID: profile.id)
+            if !failures.isEmpty {
+                reportError(
+                    "The shared Claude setup was installed in “\(profile.name)”, but the Anthropic document skills were not:\n"
+                        + failures.joined(separator: "\n"))
+            }
+        }
+    }
+
+    public func requestRemoveSharedConfig(_ profile: Profile) {
+        let alert = NSAlert()
+        alert.messageText = "Remove the shared Claude setup from “\(profile.name)”?"
+        alert.informativeText =
+            "The CLAUDE.md, agents and skill links are removed, and the settings the setup added are taken out of settings.json (backed up first). Your model choice, other settings and profile-local skills stay. Other profiles keep the shared setup."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        runExclusive { [self] in
+            defer {
+                refreshSharedConfigStatuses()
+                runDiagnostics()
+            }
+            try sharedConfig.uninstall(profileID: profile.id)
+            store.appendLog("shared-config: removed from \(profile.id)")
+        }
+    }
+
+    private func confirmOverwriteSharedEdits() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Overwrite local edits to the shared Claude setup?"
+        alert.informativeText =
+            "\(sharedConfig.deployedURL.path) differs from what the app installed (or from the bundled setup, for a copy made by install.sh or by hand). Continuing replaces it with the copy bundled with the app, for every profile that uses the shared setup. The edited copy is kept as \(sharedConfig.deployedURL.lastPathComponent).backup-<timestamp> next to it."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Overwrite")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func reportKeptSharedCopy(_ outcome: SharedConfigDeployOutcome) {
+        guard case .deployed(let kept?) = outcome else { return }
+        store.appendLog("shared-config: kept the edited copy at \(kept.path)")
+        reportError("The shared Claude setup was updated. Your edited copy was kept at \(kept.path).")
+    }
+
+    /// Spells out what a doctor reinstall changes before it runs.
+    private func confirmSharedReinstall(_ profileID: UUID, overwriteLocalEdits: Bool) -> Bool {
+        let name = store.profiles.first { $0.id == profileID }?.name ?? profileID.uuidString
+        let alert = NSAlert()
+        alert.messageText = "Reinstall the shared Claude setup in “\(name)”?"
+        alert.informativeText =
+            "CLAUDE.md, agents and the shared skills are linked again to \(sharedConfig.deployedURL.path) (a real file in the way is renamed to .backup-<timestamp>), and settings.json is rewritten after a backup: status line, fallback model and the subagent model hook. Permission settings are left as they are."
+            + (overwriteLocalEdits
+                ? " \(sharedConfig.deployedURL.path) has local edits; it is replaced and the edited copy kept as \(sharedConfig.deployedURL.lastPathComponent).backup-<timestamp>."
+                : "")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reinstall")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     // MARK: - Shell integration
 
     public func installShellIntegration() {
@@ -616,6 +741,105 @@ public final class AppViewModel {
         let url = shellIntegration.functionFileURL
         if FileManager.default.fileExists(atPath: url.path) {
             NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    // MARK: - Diagnose & Repair
+
+    public var diagnosticsHasErrors: Bool {
+        diagnosticFindings.contains { $0.severity == .error }
+    }
+
+    /// Distinct repairs that "Fix all safe issues" would apply.
+    public var safeRepairActions: [RepairAction] {
+        var seen: Set<RepairAction> = []
+        return diagnosticFindings.compactMap(\.repair).filter { $0.isSafe && seen.insert($0).inserted }
+    }
+
+    public func runDiagnostics() {
+        diagnosticFindings = diagnostics.run()
+    }
+
+    /// `.runMigration` is handled by the caller, which opens the migration
+    /// sheet; every other repair is confirmed where needed and applied here.
+    public func applyRepair(_ action: RepairAction) {
+        switch action {
+        case .moveAside(let url, _):
+            guard confirmMoveAside([url]) else { return }
+        case .overwriteSharedConfig:
+            guard confirmOverwriteSharedEdits() else { return }
+        case .installSharedConfig(let profileID, let overwriteLocalEdits):
+            guard confirmSharedReinstall(profileID, overwriteLocalEdits: overwriteLocalEdits) else { return }
+        default:
+            break
+        }
+        runRepairs([action])
+    }
+
+    public func applySafeRepairs() {
+        let actions = safeRepairActions
+        let moves = actions.compactMap { action -> URL? in
+            if case .moveAside(let url, _) = action { return url }
+            return nil
+        }
+        guard !actions.isEmpty, moves.isEmpty || confirmMoveAside(moves) else { return }
+        runRepairs(actions)
+    }
+
+    public var repairsFolderExists: Bool {
+        FileManager.default.fileExists(atPath: diagnostics.repairsDirectory.path)
+    }
+
+    public func revealRepairsFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([diagnostics.repairsDirectory])
+    }
+
+    public func copyDiagnosticsReport() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(DiagnosticsService.textReport(diagnosticFindings), forType: .string)
+    }
+
+    private func confirmMoveAside(_ urls: [URL]) -> Bool {
+        let running = manager.claudeApp.isClaudeRunning
+        let alert = NSAlert()
+        alert.messageText =
+            urls.count == 1 ? "Move “\(urls[0].lastPathComponent)” aside?" : "Move \(urls.count) folders aside?"
+        alert.informativeText =
+            urls.map(\.path).joined(separator: "\n")
+            + "\n\nThe folders are moved to \(diagnostics.repairsDirectory.path), not deleted, and keep using disk space there (vm_bundles can be many GB). Claude Desktop downloads fresh copies when Cowork next starts; delete the moved folders once Claude Desktop works again."
+            + (running ? " Claude Desktop is running and will be quit first." : "")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: running ? "Quit Claude and Move" : "Move Aside")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func runRepairs(_ actions: [RepairAction]) {
+        runExclusive { [self] in
+            defer {
+                runDiagnostics()
+                refreshShellIntegrationState()
+                refreshLoginStatuses()
+            }
+            let movesAside = actions.contains { action in
+                if case .moveAside = action { return true }
+                return false
+            }
+            if movesAside, manager.claudeApp.isClaudeRunning {
+                guard await manager.claudeApp.quitClaude() else { throw ProfileLayoutError.desktopStillRunning }
+            }
+            var failures: [String] = []
+            for action in actions {
+                do {
+                    try diagnostics.apply(action)
+                } catch {
+                    failures.append(error.localizedDescription)
+                }
+            }
+            if !failures.isEmpty {
+                reportError(failures.joined(separator: "\n"))
+            }
         }
     }
 

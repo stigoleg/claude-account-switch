@@ -2,7 +2,7 @@ import AppKit
 import ClaudeProfileSwitcherCore
 import SwiftUI
 
-@main
+/// Started by `ClaudeProfileSwitcherEntry` unless `--doctor` was passed.
 struct ClaudeProfileSwitcherApp: App {
     @State private var vm: AppViewModel
     private let instanceLock: SingleInstanceLock
@@ -53,6 +53,9 @@ struct ClaudeProfileSwitcherApp: App {
             CommandGroup(replacing: .appTermination) {}
         }
 
+        Window("Diagnose & Repair", id: "diagnostics") {
+            DiagnosticsView(vm: vm)
+        }
     }
 
     /// The menu bar status item label. `MenuBarExtra` is picky about its
@@ -67,6 +70,11 @@ struct ClaudeProfileSwitcherApp: App {
         let hex = active?.colorHex
         HStack(spacing: 5) {
             Image(nsImage: ProfileMenuBarIcon.image(forColorHex: hex))
+            if vm.diagnosticsHasErrors {
+                Text("⚠︎")
+                    .font(.system(size: 13, weight: .medium))
+                    .help("Issues found — open Diagnose & Repair")
+            }
             if let active {
                 Text(active.name)
                     .font(.system(size: 13, weight: .medium))

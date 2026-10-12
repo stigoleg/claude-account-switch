@@ -181,7 +181,7 @@ public final class ProfileManager {
         }
 
         throw ProfileError.migrationConflict(
-            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Health & Recovery."
+            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Diagnose & Repair from the menu bar."
         )
 
     }
@@ -229,7 +229,7 @@ public final class ProfileManager {
             return
         }
         throw ProfileError.migrationConflict(
-            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Health & Recovery."
+            "The current layout is neither a valid v1 symlink layout nor an unconfigured v2 layout. Open Diagnose & Repair from the menu bar."
         )
     }
 

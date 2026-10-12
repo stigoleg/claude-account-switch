@@ -41,6 +41,8 @@ brew tap stigoleg/tap
 brew install --cask claude-profile-switcher
 ```
 
+Update with `brew update && brew upgrade --cask claude-profile-switcher`, then quit and reopen the app from the menu bar.
+
 Newer Homebrew versions warn that taps outside Homebrew's own are untrusted. The install still works, and you can trust this cask with:
 
 ```bash
@@ -97,15 +99,43 @@ Enable "Sync profiles via iCloud Drive" in the menu bar dropdown and your profil
 
 Every CLI launch through the dispatcher uses its profile directory for settings, plugins, history and authentication. The v2 migration logs out the unsafe legacy global keychain context and guides you through one new CLI login per profile.
 
+### Shared Claude setup (optional)
+
+The app bundles a curated Claude Code setup: a `CLAUDE.md` operating model, four subagents (`code-scout`, `doc-researcher`, `implementer`, `verifier`), three skills, a status line, and a hook that pins subagents to an explicit model. The coding agents have the four Karpathy coding principles built in (think before coding, simplicity first, surgical changes, goal-driven execution). It is opt-in per profile: Manage Profiles → a profile's … menu → Install Shared Claude Setup…, or the checkbox when you create a profile.
+
+- The files are copied to `~/.config/claude-shared` and the profile's `cli/` links `CLAUDE.md`, `agents` and each shared skill there. Profile-local skills, other hooks and other settings stay. `settings.json` is backed up before it changes; an existing `model` choice is kept.
+- **Bypass permission prompts (yolo)** is a separate checkbox, off by default. It sets `permissions.defaultMode: "bypassPermissions"` and `skipDangerousModePermissionPrompt: true`, so Claude Code runs tools, edits files and executes commands without asking. Only enable it where you accept that.
+- The card shows "Shared setup", plus "yolo" and "update available" when they apply. Diagnose & Repair reports broken links and available updates; its reinstall asks before it changes anything and never touches the permission settings. If `~/.config/claude-shared` was edited by hand (or, for a copy made by `install.sh`, differs from the bundled setup), the app asks before replacing it and keeps the old copy as `~/.config/claude-shared.backup-<timestamp>`.
+- The status line and the subagent model hook need [jq](https://jqlang.org) (`brew install jq`); without it they silently do nothing. macOS 14 ships no jq, so the install sheet and Diagnose & Repair warn when it is missing.
+- Remove it with Remove Shared Claude Setup in the same menu. That removes the links and the settings values the setup wrote; your `model` and everything else stay.
+
+The canonical copy and the developer scripts (`install.sh`, `verify.sh`) live in [`SharedConfig/`](SharedConfig/README.md).
+
 ## Stepping away
 
 Menu bar → Disable & Restore Default Layout keeps the real active Desktop directory in place, backs up the fallback CLI directory, restores the selected profile to `~/.claude`, and removes the managed shell hooks. Other profiles and migration backups remain on disk.
+
+## Diagnose & Repair
+
+Menu bar → Diagnose & Repair… (also under More in Manage Profiles) checks the profile layout, every Desktop profile's Cowork VM files, and the Claude Code shell integration. Checking never changes anything. Each problem has a Fix button where the app can repair it, and Copy Report puts a plain-text report on the clipboard for support. Reveal Repairs Folder appears once a repair has moved something aside.
+
+Without opening the app, the same report is available from Terminal:
+
+```sh
+"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor          # text report
+"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor --json   # JSON report
+"/Applications/Claude Profile Switcher.app/Contents/MacOS/ClaudeProfileSwitcher" --doctor --fix    # safe repairs, then report
+```
+
+`--doctor` exits 1 when it finds errors or warnings. `--fix` only runs safe repairs: it moves broken Cowork VM folders aside, removes stale temporary links and reinstalls the shell integration. It refuses while the menu bar app is running (use the window instead), never runs the layout migration, and never reinstalls the shared Claude setup; it prints which findings need the app.
+
+**"failed to open SDK binary … claude-code-vm/<version>/claude: too many levels of symbolic links".** Cowork's Linux VM opens Claude Desktop's files through virtiofs and refuses symlinks anywhere in the path. Either `~/Library/Application Support/Claude` is still a legacy v1 symlink (run the migration from Manage Profiles), or a symlink sits inside `claude-code-vm` or `vm_bundles`. In the Diagnose & Repair window the repair quits Claude Desktop first (after asking); `--doctor --fix` instead refuses to move the folder while Claude Desktop runs, so quit it and run again. The folder is moved to `~/Library/Application Support/ClaudeProfileSwitcher/repairs/<timestamp>/`; nothing is deleted, and Claude Desktop downloads a fresh copy the next time Cowork starts. The moved folder keeps using disk space (`vm_bundles` can be many GB): delete it from the repairs folder once Claude Desktop works again. A symlinked `~/Library` or home folder is reported but must be fixed by hand.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Migration or recovery is required | Open Manage Profiles and use the health banner. Switching stays disabled until the layout is unambiguous. |
+| Migration or recovery is required | Open Manage Profiles and use the health banner, or Diagnose & Repair. Switching stays disabled until the layout is unambiguous. |
 | Claude Desktop will not quit during a switch | The app force quits after 8 seconds. If even that fails, quit it manually and retry. |
 | An open terminal still shows the old account | Expected: existing CLI processes keep their account. Open a new terminal for the newly selected default. |
 | Need to verify or restore the migration backup | Use Verify Backup or Restore Backup in the green health banner. Restore first preserves the current v2 data under `Backups/pre-restore-v2-*`. |
@@ -163,6 +193,7 @@ Sources/
 Tests/ClaudeProfileSwitcherCoreTests/   XCTest and dispatcher integration suite
 AppBundle/                         Info.plist + entitlements + icon
 Packaging/homebrew/                cask template for the tap
+SharedConfig/                      optional shared Claude setup, bundled into the app
 Scripts/                           version stamping, dmg, icon generation
 .github/workflows/                 build.yml + release.yml
 Makefile, build-app.sh             build / test / package

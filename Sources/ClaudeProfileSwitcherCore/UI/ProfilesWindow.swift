@@ -9,6 +9,7 @@ public struct ProfilesWindow: View {
     @State private var showAddProfileSheet: Bool = false
     @State private var sheetName: String = ""
     @FocusState private var newProfileFieldFocused: Bool
+    @Environment(\.openWindow) private var openWindow
 
     public init(vm: AppViewModel) {
         self._vm = Bindable(wrappedValue: vm)
@@ -45,11 +46,18 @@ public struct ProfilesWindow: View {
                 vm.copyConfigTarget = nil
             }
         }
+        .sheet(item: $vm.sharedConfigTarget) { profile in
+            SharedConfigSheet(vm: vm, profile: profile) {
+                vm.sharedConfigTarget = nil
+            }
+        }
         .sheet(isPresented: $showAddProfileSheet) {
             AddProfileSheet(
                 initialName: sheetName,
-                onCreate: { name in
-                    vm.createProfile(named: name)
+                sharedConfigAvailable: vm.sharedConfig.isAvailable,
+                installSharedConfigByDefault: vm.anyProfileHasSharedConfig,
+                onCreate: { name, installSharedConfig in
+                    vm.createProfile(named: name, installSharedConfig: installSharedConfig)
                     showAddProfileSheet = false
                     sheetName = ""
                 },
@@ -159,20 +167,25 @@ public struct ProfilesWindow: View {
                 .keyboardShortcut("n", modifiers: [.command])
                 .disabled(!profileCreationAllowed)
 
-                if vm.store.activeProfile != nil {
-                    Menu {
+                Menu {
+                    Button {
+                        openDiagnostics()
+                    } label: {
+                        Label("Diagnose & Repair…", systemImage: "stethoscope")
+                    }
+                    if vm.store.activeProfile != nil {
                         Button(role: .destructive) {
                             vm.requestDisableAndRestore()
                         } label: {
                             Label("Disable & Restore Default Layout…", systemImage: "arrow.uturn.backward")
                         }
-                    } label: {
-                        Label("More", systemImage: "ellipsis.circle")
                     }
-                    .menuStyle(.borderlessButton)
-                    .frame(maxWidth: 90, alignment: .trailing)
-                    .help("Other operations: restore the default Claude layout.")
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
                 }
+                .menuStyle(.borderlessButton)
+                .frame(maxWidth: 90, alignment: .trailing)
+                .help("Other operations: diagnose and repair, restore the default Claude layout.")
             }
         }
         .padding()
@@ -215,11 +228,20 @@ public struct ProfilesWindow: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
         case .recoveryRequired(let detail), .unsupportedFilesystem(let detail):
-            Label(detail, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+            HStack {
+                Label(detail, systemImage: "exclamationmark.triangle.fill")
+                Spacer()
+                Button("Diagnose & Repair…") { openDiagnostics() }
+            }
+            .foregroundStyle(.red)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
         }
+    }
+
+    private func openDiagnostics() {
+        openWindow(id: "diagnostics")
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - List / empty state
@@ -459,16 +481,23 @@ public struct ProfilesWindow: View {
 
 private struct AddProfileSheet: View {
     let initialName: String
-    let onCreate: (String) -> Void
+    let sharedConfigAvailable: Bool
+    let onCreate: (String, Bool) -> Void
     let onCancel: () -> Void
     @State private var name: String = ""
+    @State private var installSharedConfig: Bool
     @FocusState private var fieldFocused: Bool
 
-    init(initialName: String, onCreate: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        initialName: String, sharedConfigAvailable: Bool, installSharedConfigByDefault: Bool,
+        onCreate: @escaping (String, Bool) -> Void, onCancel: @escaping () -> Void
+    ) {
         self.initialName = initialName
+        self.sharedConfigAvailable = sharedConfigAvailable
         self.onCreate = onCreate
         self.onCancel = onCancel
         self._name = State(initialValue: initialName)
+        self._installSharedConfig = State(initialValue: sharedConfigAvailable && installSharedConfigByDefault)
     }
 
     var body: some View {
@@ -491,6 +520,13 @@ private struct AddProfileSheet: View {
                 .focused($fieldFocused)
                 .onSubmit { submit() }
 
+            if sharedConfigAvailable {
+                Toggle("Install the shared Claude setup (permission prompts stay on)", isOn: $installSharedConfig)
+                    .help(
+                        "CLAUDE.md, agents, skills and settings bundled with this app. Manage it later from the profile's … menu."
+                    )
+            }
+
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel, action: onCancel)
@@ -509,7 +545,7 @@ private struct AddProfileSheet: View {
     private func submit() {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return }
-        onCreate(n)
+        onCreate(n, installSharedConfig)
     }
 }
 
@@ -585,6 +621,7 @@ private struct ProfileCardView: View {
                         .background(profile.color.opacity(0.2), in: Capsule())
                         .foregroundStyle(profile.color)
                 }
+                sharedConfigBadges
             }
 
             Spacer()
@@ -600,6 +637,7 @@ private struct ProfileCardView: View {
                         vm.copyConfigTarget = profile
                     }
                     .disabled(vm.store.profiles.count < 2 || vm.isSwitching)
+                    sharedConfigMenuItems
                     Divider()
                     Button("Delete…", role: .destructive, action: requestDelete)
                         .disabled(isActive)
@@ -611,6 +649,48 @@ private struct ProfileCardView: View {
                 .frame(width: 32)
             }
         }
+    }
+
+    private var sharedConfigStatus: SharedConfigStatus { vm.sharedConfigStatus(for: profile) }
+
+    @ViewBuilder
+    private var sharedConfigMenuItems: some View {
+        let unavailable = !vm.sharedConfig.isAvailable || localState == .setupRequired || vm.isSwitching
+        if sharedConfigStatus == .notInstalled {
+            Button("Install Shared Claude Setup…") { vm.sharedConfigTarget = profile }
+                .disabled(unavailable)
+        } else {
+            Button("Update Shared Claude Setup…") { vm.sharedConfigTarget = profile }
+                .disabled(unavailable)
+            Button("Remove Shared Claude Setup") { vm.requestRemoveSharedConfig(profile) }
+                .disabled(unavailable)
+        }
+    }
+
+    @ViewBuilder
+    private var sharedConfigBadges: some View {
+        switch sharedConfigStatus {
+        case .notInstalled:
+            EmptyView()
+        case .installed(let yolo):
+            badge("Shared setup", color: .secondary)
+            if yolo { badge("yolo", color: .orange) }
+        case .outdated:
+            badge("Shared setup", color: .secondary)
+            if vm.sharedConfig.isYoloEnabled(profileID: profile.id) { badge("yolo", color: .orange) }
+            badge("update available", color: .blue)
+        case .broken(let problems):
+            badge("Shared setup needs repair", color: .red)
+                .help(problems.joined(separator: "\n"))
+        }
+    }
+
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2).fontWeight(.semibold)
+            .padding(.horizontal, 8).padding(.vertical, 2)
+            .background(color.opacity(0.15), in: Capsule())
+            .foregroundStyle(color)
     }
 
     private var statusRow: some View {

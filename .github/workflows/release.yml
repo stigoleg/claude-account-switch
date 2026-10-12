@@ -148,13 +148,22 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The cask template in this repo is the source of truth, so caveats and
+      # stanzas reach the tap together with the version bump.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: steps.token.outputs.skip != 'true'
+        with:
+          path: source
+          sparse-checkout: Packaging/homebrew
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         if: steps.token.outputs.skip != 'true'
         with:
           repository: stigoleg/homebrew-tap
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
 
-      - name: Bump cask version and sha256
+      - name: Render cask from template
         if: steps.token.outputs.skip != 'true'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -163,15 +172,19 @@ jobs:
           # bytes users will fetch.
           curl -fsSL --retry 5 --retry-delay 5 -o app.zip "$URL"
           SHA="$(sha256sum app.zip | cut -d' ' -f1)"
-          sed -i -E \
+          CASK=tap/Casks/claude-profile-switcher.rb
+          sed -E \
             -e "s|^  version \".*\"|  version \"${VERSION}\"|" \
             -e "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" \
-            Casks/claude-profile-switcher.rb
+            source/Packaging/homebrew/claude-profile-switcher.rb > "$CASK"
+          grep -q "^  version \"${VERSION}\"$" "$CASK"
+          grep -q "^  sha256 \"${SHA}\"$" "$CASK"
           rm app.zip
 
       - name: Commit and push
         if: steps.token.outputs.skip != 'true'
         run: |
+          cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "claude-profile-switcher ${GITHUB_REF_NAME#v}"

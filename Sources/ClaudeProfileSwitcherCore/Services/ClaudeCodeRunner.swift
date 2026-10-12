@@ -34,6 +34,14 @@ public protocol ClaudeCodeRunning: Sendable {
     func executableURL() -> URL?
     func authStatus(configDirectory: URL) async throws -> ClaudeCodeAuthStatus
     func logout(configDirectory: URL?) async throws
+    /// Run an arbitrary `claude` subcommand against one profile's config dir.
+    func runCommand(_ arguments: [String], configDirectory: URL, timeout: TimeInterval) async throws
+}
+
+extension ClaudeCodeRunning {
+    public func runCommand(_ arguments: [String], configDirectory: URL, timeout: TimeInterval) async throws {
+        throw ClaudeCodeRunnerError.executableNotFound
+    }
 }
 
 public struct ClaudeCodeRunner: ClaudeCodeRunning, Sendable {
@@ -62,9 +70,13 @@ public struct ClaudeCodeRunner: ClaudeCodeRunning, Sendable {
         _ = try await run(arguments: ["auth", "logout"], configDirectory: configDirectory)
     }
 
-    private func run(arguments: [String], configDirectory: URL?) async throws -> Data {
+    public func runCommand(_ arguments: [String], configDirectory: URL, timeout: TimeInterval) async throws {
+        _ = try await run(arguments: arguments, configDirectory: configDirectory, timeout: timeout)
+    }
+
+    private func run(arguments: [String], configDirectory: URL?, timeout: TimeInterval? = nil) async throws -> Data {
         guard let executable = executableURL() else { throw ClaudeCodeRunnerError.executableNotFound }
-        let timeout = self.timeout
+        let timeout = timeout ?? self.timeout
         return try await Task.detached(priority: .utility) {
             let process = Process()
             process.executableURL = executable

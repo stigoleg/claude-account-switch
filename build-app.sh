@@ -53,6 +53,13 @@ if [[ -f AppBundle/AppIcon.icns ]]; then
     cp AppBundle/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# The optional shared Claude setup (Manage Profiles → … → Install Shared Claude
+# Setup). Plain copy, not an SPM resource; must happen before signing.
+mkdir -p "$APP/Contents/Resources/SharedConfig"
+cp -R SharedConfig/claude-shared "$APP/Contents/Resources/SharedConfig/"
+cp SharedConfig/settings-fragment.json "$APP/Contents/Resources/SharedConfig/"
+find "$APP/Contents/Resources/SharedConfig" -name .DS_Store -delete
+
 # SPM may produce a resource bundle for any explicit resources; copy it through if present.
 BUNDLE="$BIN_PATH/ClaudeProfileSwitcher_ClaudeProfileSwitcher.bundle"
 if [[ -d "$BUNDLE" ]]; then

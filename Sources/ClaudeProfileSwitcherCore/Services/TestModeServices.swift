@@ -33,4 +33,5 @@ struct TestModeClaudeCodeRunner: ClaudeCodeRunning {
         ClaudeCodeAuthStatus(loggedIn: false, authMethod: "none", apiProvider: "test")
     }
     func logout(configDirectory: URL?) async throws {}
+    func runCommand(_ arguments: [String], configDirectory: URL, timeout: TimeInterval) async throws {}
 }
