@@ -1,0 +1,23 @@
+{
+  "fallbackModel": ["sonnet"],
+  "statusLine": {
+    "type": "command",
+    "command": "__SHARED__/statusline.sh",
+    "padding": 0
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __SHARED__/hooks/pin-subagent-model.sh",
+            "timeout": 10,
+            "statusMessage": "Pinning subagent model"
+          }
+        ]
+      }
+    ]
+  }
+}

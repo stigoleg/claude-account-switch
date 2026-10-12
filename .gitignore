@@ -27,3 +27,8 @@ CLAUDE.md
 SKILL.md
 .codex/
 .agents/
+
+# The bundled shared Claude setup is shipped product content, not local
+# instructions.
+!SharedConfig/claude-shared/CLAUDE.md
+!SharedConfig/claude-shared/skills/*/SKILL.md
