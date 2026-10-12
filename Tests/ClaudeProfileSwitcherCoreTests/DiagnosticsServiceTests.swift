@@ -208,7 +208,7 @@ final class DiagnosticsServiceTests: XCTestCase {
 
         let findings = h.service.run()
 
-        let target = errors(findings).compactMap(moveAsideTarget).first
+        let target = errors(findings).compactMap { moveAsideTarget($0) }.first
         XCTAssertEqual(target?.0.standardizedFileURL.path, vm.standardizedFileURL.path)
         XCTAssertEqual(target?.1, h.inactive.id)
     }
