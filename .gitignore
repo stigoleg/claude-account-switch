@@ -18,6 +18,7 @@ dist/
 *.cer
 *.provisionprofile
 *.mobileprovision
+.env
 .env.signing
 
 # Local AI-agent instructions and recipes are workstation-specific and must

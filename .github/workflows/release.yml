@@ -1,11 +1,21 @@
 name: release
 
+# Fallback for releasing from CI. Normal releases run locally with
+# `make release VERSION=x.y.z` (Scripts/release.sh), which keeps the Developer
+# ID key on the Mac; this workflow needs the signing secrets in SIGNING.md.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release, e.g. v2.1.0
+        required: true
 
 permissions:
   contents: write
+  actions: write
+
+env:
+  TAG: ${{ inputs.tag }}
 
 jobs:
   release:
@@ -14,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ inputs.tag }}
           # Required: Scripts/version.sh uses `git describe --exact-match`
           # and `git rev-list --count`, both of which need full history.
           fetch-depth: 0
@@ -28,7 +39,7 @@ jobs:
 
       - name: Guard — tag must match resolved version
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TAG_VERSION="${TAG#v}"
           RESOLVED="$(make -s version)"
           if [ "$TAG_VERSION" != "$RESOLVED" ]; then
             echo "::error::tag $TAG_VERSION != resolved version $RESOLVED"
@@ -109,8 +120,8 @@ jobs:
         run: |
           STAMPED=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
             "build/Claude Profile Switcher.app/Contents/Info.plist")
-          if [ "$STAMPED" != "${GITHUB_REF_NAME#v}" ]; then
-            echo "::error::bundle stamped $STAMPED, expected ${GITHUB_REF_NAME#v}"
+          if [ "$STAMPED" != "${TAG#v}" ]; then
+            echo "::error::bundle stamped $STAMPED, expected ${TAG#v}"
             exit 1
           fi
 
@@ -119,73 +130,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           RELEASE_FLAGS=()
-          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+          if [[ "${TAG#v}" == *-* ]]; then
             RELEASE_FLAGS+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$TAG" \
+            --title "$TAG" \
             --generate-notes \
             "${RELEASE_FLAGS[@]}" \
             dist/*.zip dist/*.dmg dist/*.json dist/SHA256SUMS
 
-  # Bumps the Homebrew cask in the tap repo. Requires the TAP_GITHUB_TOKEN
-  # secret: a fine-grained PAT scoped to ONLY the tap repo with contents
-  # read/write (the default GITHUB_TOKEN cannot push to other repos).
-  # Skips gracefully while the tap/secret don't exist yet.
-  update-cask:
-    needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check tap token
-        id: token
+      # A release created with GITHUB_TOKEN does not trigger other workflows,
+      # so start the cask update explicitly.
+      - name: Update Homebrew cask
+        if: ${{ !contains(inputs.tag, '-') }}
         env:
-          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-        run: |
-          if [ -z "$TAP_TOKEN" ]; then
-            echo "::warning::TAP_GITHUB_TOKEN not set — skipping Homebrew cask update."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # The cask template in this repo is the source of truth, so caveats and
-      # stanzas reach the tap together with the version bump.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: steps.token.outputs.skip != 'true'
-        with:
-          path: source
-          sparse-checkout: Packaging/homebrew
-
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: steps.token.outputs.skip != 'true'
-        with:
-          repository: stigoleg/homebrew-tap
-          token: ${{ secrets.TAP_GITHUB_TOKEN }}
-          path: tap
-
-      - name: Render cask from template
-        if: steps.token.outputs.skip != 'true'
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/ClaudeProfileSwitcher-${VERSION}.zip"
-          # Re-download the published asset so the checksum covers the exact
-          # bytes users will fetch.
-          curl -fsSL --retry 5 --retry-delay 5 -o app.zip "$URL"
-          SHA="$(sha256sum app.zip | cut -d' ' -f1)"
-          CASK=tap/Casks/claude-profile-switcher.rb
-          sed -E \
-            -e "s|^  version \".*\"|  version \"${VERSION}\"|" \
-            -e "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" \
-            source/Packaging/homebrew/claude-profile-switcher.rb > "$CASK"
-          grep -q "^  version \"${VERSION}\"$" "$CASK"
-          grep -q "^  sha256 \"${SHA}\"$" "$CASK"
-          rm app.zip
-
-      - name: Commit and push
-        if: steps.token.outputs.skip != 'true'
-        run: |
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "claude-profile-switcher ${GITHUB_REF_NAME#v}"
-          git push
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cask.yml -f tag="$TAG"

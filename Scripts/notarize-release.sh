@@ -4,7 +4,16 @@ set -euo pipefail
 : "${CODESIGN_IDENTITY:?Set CODESIGN_IDENTITY to your Developer ID Application identity}"
 : "${APPLE_TEAM_ID:?Set APPLE_TEAM_ID}"
 : "${DEVELOPER_ID_PROVISIONING_PROFILE:?Set DEVELOPER_ID_PROVISIONING_PROFILE}"
-: "${NOTARY_KEYCHAIN_PROFILE:?Set NOTARY_KEYCHAIN_PROFILE to the notarytool keychain profile name}"
+# notarytool credentials: a stored keychain profile, or an App Store Connect
+# API key given directly (the same key works for every app on the team).
+if [[ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
+  notary_auth=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
+elif [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" && -f "${APPLE_API_PRIVATE_KEY_PATH:-}" ]]; then
+  notary_auth=(--key "$APPLE_API_PRIVATE_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
+else
+  echo "error: set NOTARY_KEYCHAIN_PROFILE, or APPLE_API_KEY_ID, APPLE_API_ISSUER and APPLE_API_PRIVATE_KEY_PATH" >&2
+  exit 2
+fi
 
 version="$(./Scripts/version.sh version)"
 if [[ "$version" == "0.0.0-dev" && "${ALLOW_DEV_NOTARIZATION:-0}" != "1" ]]; then
@@ -29,7 +38,7 @@ trap cleanup EXIT
 ditto -c -k --keepParent \
   "build/Claude Profile Switcher.app" "$notary_tmp_dir/app.zip"
 xcrun notarytool submit "$notary_tmp_dir/app.zip" \
-  --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait
+  "${notary_auth[@]}" --wait
 xcrun stapler staple "build/Claude Profile Switcher.app"
 xcrun stapler validate "build/Claude Profile Switcher.app"
 spctl --assess --type execute --verbose=4 "build/Claude Profile Switcher.app"
@@ -39,7 +48,7 @@ for disk_image in dist/*.dmg; do
   codesign --force --sign "$CODESIGN_IDENTITY" --timestamp "$disk_image"
   codesign --verify --strict --verbose=2 "$disk_image"
   xcrun notarytool submit "$disk_image" \
-    --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait
+    "${notary_auth[@]}" --wait
   xcrun stapler staple "$disk_image"
   xcrun stapler validate "$disk_image"
   spctl --assess --type open --context context:primary-signature --verbose=4 "$disk_image"

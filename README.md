@@ -165,13 +165,14 @@ Public releases require Developer ID, the iCloud provisioning profile and notari
 
 [`build.yml`](.github/workflows/build.yml) runs on every push and PR to `main`: lint, tests, signature verification and builds on macOS 14, 15 and 26. Pushes upload the newest-runner `.app` as a short-lived artifact.
 
-[`release.yml`](.github/workflows/release.yml) runs on a `v*` tag: tests, a version guard, `make dist`, a GitHub Release with the zip, dmg, SHA256SUMS and generated notes, and finally a Homebrew cask bump in [`stigoleg/homebrew-tap`](https://github.com/stigoleg/homebrew-tap).
-
-Cutting a release is one command:
+Releases are built, signed and notarized locally, so the Developer ID key never leaves the Mac. Put the signing values in `.env` (gitignored; see [SIGNING.md](SIGNING.md)), then:
 
 ```bash
-git tag v2.0.0-rc.1 && git push origin v2.0.0-rc.1
+make release-check VERSION=2.1.0   # lint, tests, signed + notarized dist/, nothing pushed
+make release VERSION=2.1.0         # the same, then tag, push and create the GitHub release
 ```
+
+Publishing the release triggers [`cask.yml`](.github/workflows/cask.yml), which renders `Packaging/homebrew/` into [`stigoleg/homebrew-tap`](https://github.com/stigoleg/homebrew-tap). Versions with a suffix such as `2.1.0-rc.1` become GitHub prereleases and leave the cask alone. [`release.yml`](.github/workflows/release.yml) is a manual fallback that releases an existing tag from CI and needs the signing secrets.
 
 The git tag is the single source of truth for the version. `AppBundle/Info.plist` holds template values that `build-app.sh` stamps at build time (`CFBundleVersion` is the commit count), and untagged local builds are stamped `0.0.0-dev`. The cask bump needs the `TAP_GITHUB_TOKEN` repo secret, a fine grained PAT with contents read and write access scoped to the tap repo only. Without it, that job skips with a warning.
 
@@ -195,6 +196,6 @@ AppBundle/                         Info.plist + entitlements + icon
 Packaging/homebrew/                cask template for the tap
 SharedConfig/                      optional shared Claude setup, bundled into the app
 Scripts/                           version stamping, dmg, icon generation
-.github/workflows/                 build.yml + release.yml
+.github/workflows/                 build.yml, release.yml, cask.yml
 Makefile, build-app.sh             build / test / package
 ```

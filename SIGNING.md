@@ -130,9 +130,26 @@ the checksums. For a release candidate, tag the exact commit first:
 Never commit certificate exports, private keys, app-specific passwords, API
 keys, or provisioning profiles.
 
-## 5. Configure GitHub Actions
+## 5. Release locally (default)
 
-The release workflow requires these repository secrets:
+`make release-check VERSION=x.y.z` and `make release VERSION=x.y.z` run
+Scripts/release.sh, which reads the signing values from `.env` in the repo
+root (gitignored), or from `$SIGNING_ENV_FILE`:
+
+    CODESIGN_IDENTITY="Developer ID Application: Stig-Ole Gundersen (49P95434EE)"
+    APPLE_TEAM_ID=49P95434EE
+    DEVELOPER_ID_PROVISIONING_PROFILE=/absolute/path/ClaudeProfileSwitcher.provisionprofile
+    APPLE_API_KEY_ID=XXXXXXXXXX
+    APPLE_API_ISSUER=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    APPLE_API_PRIVATE_KEY_PATH=/absolute/path/AuthKey_XXXXXXXXXX.p8
+
+The App Store Connect API key is team-wide, so one key serves every app.
+`NOTARY_KEYCHAIN_PROFILE` can replace the three `APPLE_API_*` values. The
+certificate stays in the login keychain; no .p12 export is needed.
+
+## 6. Configure GitHub Actions (optional fallback)
+
+The manual release workflow requires these repository secrets:
 
 - DEVELOPER_ID_P12_BASE64: base64-encoded .p12 containing the certificate and
   private key.

@@ -10,7 +10,7 @@ DMG_NAME     = ClaudeProfileSwitcher-$(VERSION).dmg
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build debug run test clean install uninstall xcode icon signing-check notarized-dist \
+.PHONY: help build debug run test clean install uninstall xcode icon signing-check notarized-dist release-check release \
         version release-zip package-release-zip dmg package-dmg sbom checksums dist dist-from-build lint
 
 help: ## Show this help
@@ -40,6 +40,12 @@ signing-check: ## Validate Developer ID certificate, Team ID and provisioning pr
 
 notarized-dist: ## Build, notarize, staple and package a Developer ID release
 	bash ./Scripts/notarize-release.sh
+
+release-check: ## Pre-release pipeline: lint, tests, signed + notarized dist/ for VERSION=x.y.z; pushes nothing
+	bash ./Scripts/release.sh "$(VERSION)"
+
+release: ## Pre-release pipeline, then tag, push and create the GitHub release for VERSION=x.y.z
+	bash ./Scripts/release.sh "$(VERSION)" --publish
 
 version: ## Print the resolved app version (git tag → version)
 	@./Scripts/version.sh version
